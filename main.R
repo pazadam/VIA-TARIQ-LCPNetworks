@@ -100,8 +100,15 @@ distance_euc <- units::drop_units(distance_euc)
 distance_network <- (edge_list$lengthGeo)
 
 #Calculate Detour index for edges
-detour_index <- data.frame (
+detour_index_df <- data.frame (
   detour_index = distance_euc/distance_network)
+
+detour_index <- distance_euc/distance_network
+
+#Add detour index as an edge attribute
+road_network_2_sf <- road_network_2_sf%>%
+  activate("edges")%>%
+  mutate(detour_in = detour_index)
 
 ##Detour centrality (node based)
 #Get node distance matrix
@@ -273,8 +280,8 @@ closeness_distance_norm <- closeness(road_network_1, weights = E(road_network_1)
 #Add as a node attribute
 road_network_2_sf <- road_network_2_sf %>%
   activate("nodes") %>%
-  mutate(closeness = closeness_distance) %>%
-  mutate(closeness_n = closeness_distance_norm)
+  mutate(close = closeness_distance) %>%
+  mutate(closeN = closeness_distance_norm)
 
 #Time-weighted closeness
 closeness_time <- closeness(road_network_1, weights = E(road_network_1)$timeWeight)
@@ -283,8 +290,8 @@ closeness_time_norm <- closeness(road_network_1, weights = E(road_network_1)$tim
 #Add as a node attribute
 road_network_2_sf <- road_network_2_sf %>%
   activate("nodes") %>%
-  mutate(close_time = closeness_time) %>%
-  mutate(close_time_n = closeness_time_norm)
+  mutate(closeTime = closeness_time) %>%
+  mutate(closeTimeN = closeness_time_norm)
 
 ##Betweenness - nodes
 #Distance weighted betweenness
@@ -294,8 +301,8 @@ betweenness_distance_n <- betweenness(road_network_1, v = V(road_network_1), wei
 #Add as a node attribute
 road_network_2_sf <- road_network_2_sf %>%
   activate("nodes") %>%
-  mutate(bet_dist = betweenness_distance) %>%
-  mutate(bet_dist_n = betweenness_distance_n)
+  mutate(betDist = betweenness_distance) %>%
+  mutate(betDistN = betweenness_distance_n)
 
 #Time weighted betweenness
 betweenness_time <- betweenness(road_network_1, v = V(road_network_1), weights = E(road_network_1)$timeWeight)
@@ -304,8 +311,8 @@ betweenness_time_n <- betweenness(road_network_1, v = V(road_network_1), weights
 #Add as a node attribute
 road_network_2_sf <- road_network_2_sf %>%
   activate("nodes") %>%
-  mutate(bet_time = betweenness_time) %>%
-  mutate(bet_time_n = betweenness_time_n)
+  mutate(betTime = betweenness_time) %>%
+  mutate(betTimeN = betweenness_time_n)
 
 ##Betweenness - edges
 #Distance weighted betweenness
@@ -314,7 +321,7 @@ betweennessE_distance <- edge_betweenness(road_network_1, e = E(road_network_1),
 #Add as an edge attribute
 road_network_2_sf <- road_network_2_sf %>%
   activate("edges") %>%
-  mutate(bet_dist = betweennessE_distance)
+  mutate(betDist = betweennessE_distance)
 
 #Time weighted betweenness
 betweennessE_time <- edge_betweenness(road_network_1, e = E(road_network_1), weights = E(road_network_1)$timeWeight)
@@ -322,7 +329,7 @@ betweennessE_time <- edge_betweenness(road_network_1, e = E(road_network_1), wei
 #Add as an edge attribute
 road_network_2_sf <- road_network_2_sf %>%
   activate("edges") %>%
-  mutate(bet_time = betweennessE_time)
+  mutate(betTime = betweennessE_time)
 
 ##Eigenvector
 #Unweighted
@@ -337,9 +344,11 @@ road_network_2_sf <- road_network_2_sf %>%
 eigen_type <- eigen_centrality(road_network_1, weights = E(road_network_1)$typeWeight)
 
 #Add as a node attribute
+eigen_vec <- eigen_type$vector
+
 road_network_2_sf <- road_network_2_sf %>%
   activate("nodes") %>%
-  mutate(eigen_type = eigen_type$vector)
+  mutate(eigenType = eigen_vec)
 
 ##Export network properties table
 network_properties <- bind_cols(density, clustering_coefficient_global, clustering_coefficient_local, gamma_index, median_detour_centrality)
@@ -355,5 +364,10 @@ write_sf(roads_edges, "output/roads_edges.shp")
 sites_nodes <- road_network_2_sf %>%
   activate("nodes") %>%
   st_as_sf()
+
+sites_nodes <- sites_nodes %>%
+  select(-component) %>%
+  select(-degree.y) %>%
+  rename(degree = degree.x)
 
 write_sf(sites_nodes, "output/sites_nodes.shp")
