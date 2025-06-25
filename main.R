@@ -1,4 +1,4 @@
-###Data preparation, network creation
+####Data preparation, network creation
 ##Load libraries
 library(sf)
 library(sfnetworks)
@@ -48,9 +48,9 @@ roads_ordered <- roads[, c("from_id", "to_id", "lengthGeo", "Type", "typeWeight"
 #Build the network
 road_network <- as_sfnetwork(x = sites, edges = roads_ordered, node_key = "idAll", from = "from_id", to = "to_id", directed = FALSE, edges_as_lines = TRUE, length_as_weight = FALSE)
 
-###Analysis
-##Global measures (size of the largest component,  density, global clustering coefficient, average local clustering coefficient, gamma index, detour)
-#Size of the largest component
+#### Analysis
+### Global measures (size of the largest component,  density, global clustering coefficient, average local clustering coefficient, gamma index, detour, triad census)
+##Size of the largest component
 size_largest_comp <- components(road_network)
 size_largest_comp <- data.frame(
   component = which.max(size_largest_comp$csize),
@@ -59,28 +59,28 @@ size_largest_comp <- data.frame(
 
 #Separate subgraph of connected roads and sites
 road_network_1 <- igraph::subgraph_from_edges(road_network, 1:964)
-
+#
 #Density
 density <- data.frame(
     density_global = edge_density(road_network_1)
 )
 
-#Clustering coefficient global
+##Clustering coefficient global
 clustering_coefficient_global <- data.frame(
   clustering_coefficient_global = transitivity(road_network_1, type = "global")
 )
 
-#Clustering coefficient local
+##Clustering coefficient local
 clustering_coefficient_local <- data.frame(
   clustering_coefficient_local = transitivity(road_network_1, type = "average")
 )
 
-#Gamma index
+##Gamma index
 gamma_index <- data.frame(
   gamma_index = ecount(road_network_1)/(3*(vcount(road_network_1)-2))
 )
 
-##Detour
+##Detour index (edge based)
 #First, we need the subgraph of all connected sites and roads to be a sfnetwork object
 road_network_2_sf <- road_network %>%
   activate(nodes) %>%
@@ -103,7 +103,7 @@ distance_network <- (edge_list$lengthGeo)
 detour_index <- data.frame (
   detour_index = distance_euc/distance_network)
 
-##Calculate detour centrality
+##Detour centrality (node based)
 #Get node distance matrix
 distance_euc_matrix <- st_distance(nodes_coord, nodes_coord)
 
@@ -118,7 +118,7 @@ distance_network_matrix <- units::set_units(distance_network_matrix, "m")
 #Calculate detour matrix
 detour_matrix <- distance_network_matrix/distance_euc_matrix
 
-#Detour centrality
+#Calculate detour centrality
 detour_centrality_normalised <- apply(detour_matrix, 1, 
                              function(row) {sum(row[is.finite(row)], na.rm = TRUE)/sum(is.finite(row))})
 
@@ -126,12 +126,12 @@ median_detour_centrality <- data.frame(
   median_detour_centrality = median(detour_centrality_normalised, na.rm = TRUE)
 )
 
-##Centrality measures
+###Centrality measures
 
-#Degree
+##Degree
 road_network_degree <- degree(road_network_2_sf %>% as.igraph())
 
-#Add degree as a node attribute attribute
+#Add degree as a node attribute
 road_network_degree_df <- data.frame(
   node_id = seq_along(road_network_degree),
   degree = as.numeric(road_network_degree)
@@ -264,3 +264,96 @@ mean_degree_comparison <- mean_degree_byz %>%
   rename(rom = mean_deg.y) %>%
   rename(byz = mean_deg.x) %>%
   select(featureTyp, hel, rom, byz)
+
+##Closeness
+#Distance-weighted closeness
+closeness_distance <- closeness(road_network_1, weights = E(road_network_1)$lengthGeo)
+closeness_distance_norm <- closeness(road_network_1, weights = E(road_network_1)$lengthGeo, normalized = TRUE)
+
+#Add as a node attribute
+road_network_2_sf <- road_network_2_sf %>%
+  activate("nodes") %>%
+  mutate(closeness = closeness_distance) %>%
+  mutate(closeness_n = closeness_distance_norm)
+
+#Time-weighted closeness
+closeness_time <- closeness(road_network_1, weights = E(road_network_1)$timeWeight)
+closeness_time_norm <- closeness(road_network_1, weights = E(road_network_1)$timeWeight, normalized = TRUE)
+
+#Add as a node attribute
+road_network_2_sf <- road_network_2_sf %>%
+  activate("nodes") %>%
+  mutate(close_time = closeness_time) %>%
+  mutate(close_time_n = closeness_time_norm)
+
+##Betweenness - nodes
+#Distance weighted betweenness
+betweenness_distance <- betweenness(road_network_1, v = V(road_network_1), weights = E(road_network_1)$lengthGeo)
+betweenness_distance_n <- betweenness(road_network_1, v = V(road_network_1), weights = E(road_network_1)$lengthGeo, normalized = TRUE)
+
+#Add as a node attribute
+road_network_2_sf <- road_network_2_sf %>%
+  activate("nodes") %>%
+  mutate(bet_dist = betweenness_distance) %>%
+  mutate(bet_dist_n = betweenness_distance_n)
+
+#Time weighted betweenness
+betweenness_time <- betweenness(road_network_1, v = V(road_network_1), weights = E(road_network_1)$timeWeight)
+betweenness_time_n <- betweenness(road_network_1, v = V(road_network_1), weights = E(road_network_1)$timeWeight, normalized = TRUE)
+
+#Add as a node attribute
+road_network_2_sf <- road_network_2_sf %>%
+  activate("nodes") %>%
+  mutate(bet_time = betweenness_time) %>%
+  mutate(bet_time_n = betweenness_time_n)
+
+##Betweenness - edges
+#Distance weighted betweenness
+betweennessE_distance <- edge_betweenness(road_network_1, e = E(road_network_1), weights = E(road_network_1)$lengthGeo)
+
+#Add as an edge attribute
+road_network_2_sf <- road_network_2_sf %>%
+  activate("edges") %>%
+  mutate(bet_dist = betweennessE_distance)
+
+#Time weighted betweenness
+betweennessE_time <- edge_betweenness(road_network_1, e = E(road_network_1), weights = E(road_network_1)$timeWeight)
+
+#Add as an edge attribute
+road_network_2_sf <- road_network_2_sf %>%
+  activate("edges") %>%
+  mutate(bet_time = betweennessE_time)
+
+##Eigenvector
+#Unweighted
+eigenvector <- eigen_centrality(road_network_1, weights = NA)
+
+#Add as a node attribute
+road_network_2_sf <- road_network_2_sf %>%
+  activate("nodes") %>%
+  mutate(eigen = eigenvector$vector)
+
+#Road type weighted
+eigen_type <- eigen_centrality(road_network_1, weights = E(road_network_1)$typeWeight)
+
+#Add as a node attribute
+road_network_2_sf <- road_network_2_sf %>%
+  activate("nodes") %>%
+  mutate(eigen_type = eigen_type$vector)
+
+##Export network properties table
+network_properties <- bind_cols(density, clustering_coefficient_global, clustering_coefficient_local, gamma_index, median_detour_centrality)
+write.csv(network_properties, file = "output/network_properties.csv")
+
+##Export roads and sites with edge and node properties
+roads_edges <- road_network_2_sf %>%
+  activate("edges") %>%
+  st_as_sf()
+
+write_sf(roads_edges, "output/roads_edges.shp")
+
+sites_nodes <- road_network_2_sf %>%
+  activate("nodes") %>%
+  st_as_sf()
+
+write_sf(sites_nodes, "output/sites_nodes.shp")
