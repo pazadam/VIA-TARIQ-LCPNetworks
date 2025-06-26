@@ -49,7 +49,7 @@ roads_ordered <- roads[, c("from_id", "to_id", "lengthGeo", "Type", "typeWeight"
 road_network <- as_sfnetwork(x = sites, edges = roads_ordered, node_key = "idAll", from = "from_id", to = "to_id", directed = FALSE, edges_as_lines = TRUE, length_as_weight = FALSE)
 
 #### Analysis
-### Global measures (size of the largest component,  density, global clustering coefficient, average local clustering coefficient, gamma index, detour, triad census)
+### Global measures (size of the largest component,  density, global clustering coefficient, average local clustering coefficient, gamma index, alpha index, detour)
 ##Size of the largest component
 size_largest_comp <- components(road_network)
 size_largest_comp <- data.frame(
@@ -59,11 +59,28 @@ size_largest_comp <- data.frame(
 
 #Separate subgraph of connected roads and sites
 road_network_1 <- igraph::subgraph_from_edges(road_network, 1:964)
-#
-#Density
+
+##Diameter
+network_diameter <- diameter(road_network_1, weights = NA)
+network_distance_diameter <- diameter(road_network_1, weights = E(road_network_1)$lengthGeo)
+
+diameter <- data.frame(
+  diameter = network_diameter
+)
+
+distance_diameter <- data.frame(
+  distance_diameter = network_distance_diameter
+)
+
+##Density
 density <- data.frame(
     density_global = edge_density(road_network_1)
 )
+
+##Average shortest path
+mean_shortest <- mean_distance(road_network_1, directed = FALSE, weights = NA)
+average_shortest_path <- data.frame(
+  average_shortest_path = mean_shortest)
 
 ##Clustering coefficient global
 clustering_coefficient_global <- data.frame(
@@ -78,6 +95,12 @@ clustering_coefficient_local <- data.frame(
 ##Gamma index
 gamma_index <- data.frame(
   gamma_index = ecount(road_network_1)/(3*(vcount(road_network_1)-2))
+)
+
+##Alpha Index
+alpha_index <- (ecount(road_network_1)-vcount(road_network_1)+1)/(2*vcount(road_network_1)-5)
+alpha <- data.frame(
+  alpha_in = alpha_index
 )
 
 ##Detour index (edge based)
@@ -351,7 +374,7 @@ road_network_2_sf <- road_network_2_sf %>%
   mutate(eigenType = eigen_vec)
 
 ##Export network properties table
-network_properties <- bind_cols(density, clustering_coefficient_global, clustering_coefficient_local, gamma_index, median_detour_centrality)
+network_properties <- bind_cols(density, diameter, mean_degree, average_shortest_path, clustering_coefficient_global, clustering_coefficient_local, gamma_index, alpha, median_detour_centrality)
 write.csv(network_properties, file = "output/network_properties.csv")
 
 ##Export roads and sites with edge and node properties
@@ -371,3 +394,5 @@ sites_nodes <- sites_nodes %>%
   rename(degree = degree.x)
 
 write_sf(sites_nodes, "output/sites_nodes.shp")
+
+###
