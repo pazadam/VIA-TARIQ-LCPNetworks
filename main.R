@@ -6,6 +6,9 @@ library(tidygraph)
 library(dplyr)
 library(igraph)
 library(ggplot2)
+library(spatgraphs)
+library(spatstat)
+library(deldir)
 
 ##Load data, sites=nodes, roads=edges
 sites <- sf::st_read("data/levant_sites.shp")
@@ -395,4 +398,138 @@ sites_nodes <- sites_nodes %>%
 
 write_sf(sites_nodes, "output/sites_nodes.shp")
 
-###
+###Network comparison
+###We compare the network with theoretical planar networks (Gabriel Graph, Relative Neighbourhood Graph, Minimum Spanning Tree, Delaunay Triangulation)
+
+#Data preparation
+#Sites dataset contains also placeholder nodes at intersections that could not be tied to any archaeological site. For network construction we will exclude these nodes.
+#Prepare observation window for spatstat to create point pattern (ppp)
+b_box <- st_read("data/b_box.shp")
+b_box <- st_zm(b_box, drop=TRUE, what = "ZM")
+b_box_geo <- st_geometry(b_box)
+b_box_owin <- as.owin(b_box_geo)
+
+#Extract point coordinates from meaningful nodes in the connected network to create ppp
+nodes <- road_network_2_sf %>%
+  activate("nodes") %>%
+  filter(featureTyp %in% c("city", "settlement", "fort", "station", "site", "bridge")) %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  setNames(c("x","y")) %>%
+  na.omit() %>%
+  unique()
+
+nodes_ppp <- ppp(nodes$x, nodes$y, window = b_box_owin)
+
+##Gabriel graph
+gg_c <- spatgraph(nodes_ppp, type = "gabriel")
+gg_c_igraph <- graph_from_adj_list(gg_c$edges, mode = "all", duplicate = TRUE)
+
+##Relative Neighbourhood Graph
+rng_c <- spatgraph(nodes_ppp, type = "RNG")
+rng_c_igraph <- graph_from_adj_list(rng_c$edges, mode = "all", duplicate = TRUE
+                                    )
+##Minimum Spanning Tree
+mst_c <- spatgraph(nodes_ppp, type = "MST")
+mst_c_igraph <- graph_from_adj_list(mst_c$edges, mode = "all", duplicate = TRUE)
+
+##Delaunay Triangulation
+dt_c <- deldir(nodes_ppp)
+dt_c_edges <- dt_c$delsgs[, c("ind1", "ind2")]
+dt_c_elist <- as.matrix(dt_c_edges)
+dt_c_igraph <- graph_from_edgelist(dt_c_elist, directed = FALSE)
+
+#Remove connections across the sea and the desert. This is done manually in the GIS, therefore the edges are exported to .shp, then the graph is recreated again with the removed links. 
+dt_c_edges_sf <- dt_c$delsgs %>%
+  rowwise() %>%
+  mutate(geometry = st_sfc(st_linestring(matrix(c(x1, x2, y1, y2), ncol = 2, byrow = FALSE)), crs = 3395)) %>%
+  st_as_sf()
+
+dt_cleaned <- st_read("data/dt_cleaned.shp")
+
+dt_cleaned_edgelist <- dt_cleaned %>%
+  select(ind1, ind2)
+
+dt_igraph_cleaned <- graph_from_data_frame(dt_cleaned_edgelist, directed = FALSE)
+
+##Add all to list
+constructed_networks <- list(gg = gg_c_igraph, rng = rng_c_igraph, mst = mst_c_igraph, dt = dt_igraph_cleaned)
+
+##Calculate properties of the constructed networks
+#Number of edges
+number_of_edges_df <- constructed_networks %>% 
+  lapply(ecount) %>%
+  stack() %>%
+  dplyr::select(ind, values) %>%
+  setNames(c("network","number_of_edges"))
+
+#Density
+density_df <- constructed_networks %>%
+  lapply(edge_density) %>%
+  stack() %>%
+  dplyr::select(ind, values) %>%
+  setNames(c("network","density"))
+
+#Gamma index
+gamma_df <- constructed_networks %>%
+  lapply(function(g) {
+    ecount(g)/(3*(vcount(g)-2))
+    }) %>%
+  stack() %>%
+  dplyr::select(ind, values) %>%
+  setNames(c("network","gamma_index"))
+
+#Alpha index
+#Since alpha index for MSP is always 0, it is excluded
+alpha_values <- sapply(names(constructed_networks), function(nm) {
+  g <- constructed_networks[[nm]]
+  if (grepl("mst", nm, ignore.case = TRUE)) {
+    NA
+  } else {
+    (ecount(g)-vcount(g)+1)/(2*vcount(g)-5)
+    }
+  }
+)
+
+alpha_df <- data.frame(
+  network = names(alpha_values),
+  alpha_index = alpha_values
+)
+
+#Clustering coefficient global
+ccg_values <- sapply(names(constructed_networks), function(nm) {
+    if (grepl("mst|rng", nm, ignore.case = TRUE)) {
+    NA_real_
+  } else {
+    transitivity(constructed_networks[[nm]], type = "global")
+  }
+})
+
+ccg_df <- data.frame(
+  network = names(ccg_values),
+  ccg = ccg_values
+)
+
+#Clustering coefficient local
+ccl_values <- sapply(names(constructed_networks), function(nm) {
+  if (grepl("mst|rng", nm, ignore.case = TRUE)) {
+    NA_real_
+  } else {
+    transitivity(constructed_networks[[nm]], type = "average")
+  }
+})
+
+ccl_df <- data.frame(
+  network = names(ccl_values),
+  ccl = ccl_values
+)
+
+#Combine tables
+constructed_networks_table <- number_of_edges_df %>%
+  left_join(density_df, by = "network") %>%
+  left_join(gamma_df, by = "network") %>%
+  left_join(alpha_df, by = "network") %>%
+  left_join(ccg_df, by = "network") %>%
+  left_join(ccl_df, by = "network")
+
+write.csv(constructed_networks_table, "output/constructed_networks_table.csv")
