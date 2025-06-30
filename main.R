@@ -533,3 +533,152 @@ constructed_networks_table <- number_of_edges_df %>%
   left_join(ccl_df, by = "network")
 
 write.csv(constructed_networks_table, "output/constructed_networks_table.csv")
+
+###Robustness
+###In order to evaluate robustness of the results of the centrality metrics (degree, time-weighted edge betweenness), a simple method adapted from 'Network Science in Archaeology' using Spearman's rho is used here.
+sim_missing_edges <- function(net,
+                              nsim = 1000,
+                              props = c(0.9, 0.8, 0.7, 0.6, 0.5,
+                                        0.4, 0.3, 0.2, 0.1),
+                              met = NA,
+                              missing_probs = NA) {
+  # Initialize required library
+  require(reshape2)
+  
+  props <- as.vector(props)
+  
+  if (FALSE %in% (is.numeric(props) & (props > 0) & (props <= 1))) {
+    stop("Variable props must be numeric and be between 0 and 1",
+         call. = F)
+  }
+  
+  # Select measure of interest based on variable met and calculate
+  if (!(met %in% c("degree", "betweenness"))) {
+    stop(
+      "Argument met must be either degree, betweenness, or eigenvector.
+      Check function call.",
+      call. = F
+    )
+  }
+  else {
+    if (met == "degree") {
+      met_orig <- igraph::degree(net)
+    }
+    else  {
+      if (met == "betweenness") {
+        met_orig <- igraph::edge_betweenness(net, directed = FALSE, weights = E(net)$timeWeight)  # <<< UPDATED LINE
+      }
+    }
+  }
+  
+  # Create data frame for out put and name columns
+  output <- matrix(NA, nsim, length(props))
+  colnames(output) <- as.character(props)
+  
+  # Iterate over each value of props and then each value from 1 to nsim
+  for (j in seq_len(length(props))) {
+    for (i in 1:nsim) {
+      # Run code in brackets if missing_probs is NA
+      if (is.na(missing_probs)[1]) {
+        sub_samp <- sample(seq(1, ecount(net)),
+                           size = round(ecount(net) * props[j], 0))
+        sub_net <- igraph::delete_edges(net, which(!(seq(1, ecount(net))
+                                                     %in% sub_samp)))
+      }
+      # Run code in brackets if missing_probs contains values
+      else {
+        sub_samp <- sample(seq(1, ecount(net)), prob = missing_probs,
+                           size = round(ecount(net) * props[j], 0))
+        sub_net <- igraph::delete_edges(net, which(!(seq(1, ecount(net))
+                                                     %in% sub_samp)))
+      }
+      
+      # Select measure of interest based on met and calculate
+      if (met == "degree") {
+        temp_stats <- igraph::degree(sub_net)
+        output[i, j] <- suppressWarnings(cor(temp_stats,
+                                             met_orig,
+                                             method = "spearman"))
+      }
+      else   {
+        if (met == "betweenness") {
+          temp_stats <- igraph::edge_betweenness(sub_net, directed = FALSE, weights = E(sub_net)$timeWeight)  # <<< UPDATED LINE
+          kept_edges <- which(seq_len(ecount(net)) %in% sub_samp)  # <<< ADDED LINE
+          
+          if (length(temp_stats) == length(kept_edges) &&
+              length(unique(temp_stats)) >= 2 &&
+              length(unique(met_orig[kept_edges])) >= 2) {
+            output[i, j] <- suppressWarnings(
+              cor(temp_stats, met_orig[kept_edges], method = "spearman")  # <<< UPDATED LINE
+            )
+          } else {
+            output[i, j] <- NA  # <<< ADDED LINE
+          }
+        }
+      }
+    }
+  }
+  
+  # Return output as data.frame
+  df_output <- suppressWarnings(melt(as.data.frame(output)))
+  return(df_output)
+}
+
+##Node degree robustness
+set.seed(99)
+node_degree_rob <- sim_missing_edges(net = road_network_1, met = "degree")
+
+##Plot the results
+ggplot(data = node_degree_rob) +
+  geom_boxplot(aes(x = variable, y = value)) +
+  xlab("Sub-Sample Size as Proportion of Original") +
+  ylab(expression("Spearman's" ~ rho)) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = rel(1)),
+    axis.text.y = element_text(size = rel(1)),
+    axis.title.x = element_text(size = rel(1)),
+    axis.title.y = element_text(size = rel(1)),
+    legend.text = element_text(size = rel(1))
+  )
+
+ggsave(filename = "node_degree_spearmansrho.tiff", path = "output/", device = "tiff", dpi = 300)
+
+##Time-weighted edge betweenness robustness
+set.seed(99)
+edge_btw_rob <- sim_missing_edges(net = road_network_1, met = "betweenness")
+
+##Plot the results
+ggplot(data = edge_btw_rob) +
+  geom_boxplot(aes(x = variable, y = value)) +
+  xlab("Sub-Sample Size as Proportion of Original") +
+  ylab(expression("Spearman's" ~ rho)) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = rel(1)),
+    axis.text.y = element_text(size = rel(1)),
+    axis.title.x = element_text(size = rel(1)),
+    axis.title.y = element_text(size = rel(1)),
+    legend.text = element_text(size = rel(1))
+  )
+
+ggsave(filename = "edge_betweeness_spearmansrho.tiff", path = "output/", device = "tiff", dpi = 300)
+
+###Community detection
+##Louvain algorithm
+community_louvain <- cluster_louvain(road_network_1, weights = NA, resolution = 1)
+
+#Add as a node attribute
+community_louvain_vec <- membership(community_louvain)
+road_network_2_sf <- road_network_2_sf %>%
+  activate("nodes") %>%
+  mutate(clusLou = community_louvain_vec)
+
+##Edge betweenness method (Girvan-Newman algorithm)
+community_edbtw <- cluster_edge_betweenness(road_network_1, weights = road_network_1$timeWeight)
+
+#Add as a node attribute
+community_edgbtw_vec <- membership(community_edbtw)
+road_network_2_sf <- road_network_2_sf %>%
+  activate("nodes") %>%
+  mutate(clusEdg = community_edgbtw_vec)
