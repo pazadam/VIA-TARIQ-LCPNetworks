@@ -9,6 +9,10 @@ library(ggplot2)
 library(spatgraphs)
 library(spatstat)
 library(deldir)
+library(raster)
+library(sp)
+library(cccd)
+library(gdistance)
 
 ##Load data, sites=nodes, roads=edges
 sites <- sf::st_read("data/levant_sites.shp")
@@ -463,6 +467,14 @@ number_of_edges_df <- constructed_networks %>%
   dplyr::select(ind, values) %>%
   setNames(c("network","number_of_edges"))
 
+#Degree
+degree_df <- constructed_networks %>% 
+  lapply(degree) %>%
+  lapply(mean) %>%
+  stack() %>%
+  dplyr::select(ind, values) %>%
+  setNames(c("network","avg_degree"))
+
 #Density
 density_df <- constructed_networks %>%
   lapply(edge_density) %>%
@@ -526,6 +538,7 @@ ccl_df <- data.frame(
 
 #Combine tables
 constructed_networks_table <- number_of_edges_df %>%
+  left_join(degree_df, by = "network") %>%
   left_join(density_df, by = "network") %>%
   left_join(gamma_df, by = "network") %>%
   left_join(alpha_df, by = "network") %>%
@@ -682,3 +695,126 @@ community_edgbtw_vec <- membership(community_edbtw)
 road_network_2_sf <- road_network_2_sf %>%
   activate("nodes") %>%
   mutate(clusEdg = community_edgbtw_vec)
+
+#######################################################################
+####Least cost path networks modelling and comparison (southern Levant)
+#######################################################################
+
+###Create network from the Roman road data for the southern case study
+#Add data
+south_sites <- st_read("data/levant_sites_south.shp")
+south_roads <- st_read("data/levant_roads_south.shp")
+south_roads <- st_zm(south_roads, drop=TRUE, what = "ZM")
+
+start_points <- st_sfc(lapply(st_geometry(south_roads), get_endpoints, "start"), crs = st_crs(south_roads))
+end_points   <- st_sfc(lapply(st_geometry(south_roads), get_endpoints, "end"), crs = st_crs(south_roads))
+
+start_sf <- st_sf(geometry = start_points)
+end_sf   <- st_sf(geometry = end_points)
+
+start_nearest <- st_nearest_feature(start_sf, south_sites)
+end_nearest   <- st_nearest_feature(end_sf, south_sites)
+
+south_roads$from_id <- south_sites$idAll[start_nearest]
+south_roads$to_id   <- south_sites$idAll[end_nearest]
+
+#Convert idAll, from_id and to_id fields to character. They are currently numeric type which sfnetworks does not accept. Also rename old 'id' field to 'PleiadesId'
+south_roads$from_id <- as.character(south_roads$from_id)
+south_roads$to_id   <- as.character(south_roads$to_id)
+south_sites$idAll   <- as.character(south_sites$idAll)
+colnames(south_sites)[5] <- "PleiadesID"
+
+#Reorder columns in roads
+south_roads_ordered <- south_roads[, c("from_id", "to_id", "lengthGeo", "Type", "typeWeight", "Avg_Slope", "pace", "timeWeight", "geometry")]
+
+#Build the network
+south_road_network <- as_sfnetwork(x = south_sites, edges = south_roads_ordered, node_key = "idAll", from = "from_id", to = "to_id", directed = FALSE, edges_as_lines = TRUE, length_as_weight = FALSE)
+
+#As igraph
+south_road_network_ig <- as.igraph(south_road_network)
+
+##Get edge list
+# Get vertex attributes (especially idAll)
+node_ids <- south_road_network %>%
+  activate("nodes") %>%
+  as_tibble() %>%
+  pull(idAll)
+
+#Extract the edge list using vertex indices
+edge_df <- as_data_frame(south_road_network_ig, what = "edges")
+
+#Add from_id and to_id by indexing into node_ids
+edge_df$from_id <- node_ids[as.numeric(edge_df$from)]
+edge_df$to_id   <- node_ids[as.numeric(edge_df$to)]
+
+#Join with original edge attributes
+edge_attributes <- south_road_network %>%
+  activate("edges") %>%
+  as_tibble()
+
+#Combine from_id and to_id
+south_edge_list <- bind_cols(
+  edge_df[, c("from_id", "to_id")],
+  edge_attributes
+)
+
+#Order the list
+south_edge_list_ordered <- south_edge_list %>%
+  mutate(
+    node_min = pmin(from_id, to_id),
+    node_max = pmax(from_id, to_id)
+  ) %>%
+  dplyr::select(node_min, node_max)
+colnames(south_edge_list_ordered) <- c("from_id", "to_id")
+
+sort_edge <- function(df) {
+  df <- df %>%
+    mutate(
+      node_min = pmin(from_id, to_id),
+      node_max = pmax(from_id, to_id)
+    ) %>%
+    dplyr::select(node_min, node_max)
+  colnames(df) <- c("from_id", "to_id")
+  return(df)
+}
+
+south_edges_sorted   <- sort_edge(south_edge_list)
+
+###Create cost distance matrix
+#Convert sites to sp object (for gdistance)
+south_sites_sp <- as(south_sites, "Spatial")
+
+#Add conductivity surface (for lestcostpath package)
+south_cs75 <- terra::rast("data/levant_conductance_75_south.tif")
+
+#Add conductivity surface (for gdistance, NA values for not passable)
+cs_na <- raster::raster("data/south_na.tif")
+
+# Create transition layer using mean(1/x) function since our raster layer values represent conductance, raster must have NA values where not passable (water)
+tr <- transition(cs_na, transitionFunction = mean, directions = 16)
+tr <- geoCorrection(tr, type = "c")
+
+#Calculate cost distance matrix
+cd <- gdistance::costDistance(tr, south_sites_sp)
+cd_matrix <- as.matrix(cd)
+
+###Create Gabriel Graph
+gg_south <- cccd::gg(cd_matrix, r = 1)
+
+#Extract edge list
+gg_south_edges <- as_data_frame(gg_south, what = "edges")
+
+#Map indices to idAll
+id_map <- south_sites$idAll
+
+gg_south_edges$from_id <- id_map[as.integer(gg_south_edges$from)]
+gg_south_edges$to_id   <- id_map[as.integer(gg_south_edges$to)]
+
+#Get GG edge list
+gg_south_edge_list <- gg_south_edges %>%
+  dplyr::select(from_id, to_id)
+
+
+###Create LCP networks
+#Create conductivity surface with leastcostpath
+south_cs <- leastcostpath::create_cs(south_cs75, neighbours = 16)
