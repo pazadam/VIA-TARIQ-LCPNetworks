@@ -758,34 +758,9 @@ south_edge_list <- bind_cols(
   edge_attributes
 )
 
-#Order the list
-south_edge_list_ordered <- south_edge_list %>%
-  mutate(
-    node_min = pmin(from_id, to_id),
-    node_max = pmax(from_id, to_id)
-  ) %>%
-  dplyr::select(node_min, node_max)
-colnames(south_edge_list_ordered) <- c("from_id", "to_id")
-
-sort_edge <- function(df) {
-  df <- df %>%
-    mutate(
-      node_min = pmin(from_id, to_id),
-      node_max = pmax(from_id, to_id)
-    ) %>%
-    dplyr::select(node_min, node_max)
-  colnames(df) <- c("from_id", "to_id")
-  return(df)
-}
-
-south_edges_sorted   <- sort_edge(south_edge_list)
-
 ###Create cost distance matrix
 #Convert sites to sp object (for gdistance)
 south_sites_sp <- as(south_sites, "Spatial")
-
-#Add conductivity surface (for lestcostpath package)
-south_cs75 <- terra::rast("data/levant_conductance_75_south.tif")
 
 #Add conductivity surface (for gdistance, NA values for not passable)
 cs_na <- raster::raster("data/south_na.tif")
@@ -810,11 +785,225 @@ id_map <- south_sites$idAll
 gg_south_edges$from_id <- id_map[as.integer(gg_south_edges$from)]
 gg_south_edges$to_id   <- id_map[as.integer(gg_south_edges$to)]
 
-#Get GG edge list
+#Get GG edge list where from_id, to _id corresponds to idAll
 gg_south_edge_list <- gg_south_edges %>%
   dplyr::select(from_id, to_id)
 
+###Create Relative Neighbourhood Graph
+rng_south <- cccd::rng(cd_matrix, r = 1)
+
+#Extract edge list
+rng_south_edges <- as_data_frame(rng_south, what = "edges")
+
+#Get RNG edge list
+rng_south_edges$from_id <- id_map[as.integer(rng_south_edges$from)]
+rng_south_edges$to_id   <- id_map[as.integer(rng_south_edges$to)]
+
+rng_south_edge_list <- rng_south_edges %>%
+  dplyr::select(from_id, to_id)
+
+###Create K=4 Nearest Neighbour Graph
+k4_south <- cccd::nng(cd_matrix, k = 4, mutual = FALSE)
+
+#Extract edge list
+k4_south_edges <- as_data_frame(k4_south, what = "edges")
+
+#Get RNG edge list
+k4_south_edges$from_id <- id_map[as.integer(k4_south_edges$from)]
+k4_south_edges$to_id   <- id_map[as.integer(k4_south_edges$to)]
+
+k4_south_edge_list <- k4_south_edges %>%
+  dplyr::select(from_id, to_id)
+
+###Compare edge lists (common edges, only in road network, only in modeled networks)
+##Create character keys from edge lists
+#Normalize edge ordering
+sort_edges <- function(df) {
+  df %>%
+    mutate(
+      edge_min = pmin(from_id, to_id),
+      edge_max = pmax(from_id, to_id)
+    ) %>%
+    dplyr::select(edge_min, edge_max)
+}
+
+south_roads_edges_key <- sort_edges(south_edge_list) %>%
+  mutate(key = paste(edge_min, edge_max, sep = "-")) %>%
+  pull(key)
+
+gg_edges_key <- sort_edges(gg_south_edge_list) %>%
+  mutate(key = paste(edge_min, edge_max, sep = "-")) %>%
+  pull(key)
+
+rng_edges_key <- sort_edges(rng_south_edge_list) %>%
+  mutate(key = paste(edge_min, edge_max, sep = "-")) %>%
+  pull(key)
+
+k4_edges_key <- sort_edges(k4_south_edge_list) %>%
+  mutate(key = paste(edge_min, edge_max, sep = "-")) %>%
+  pull(key)
+
+#south_roads_edges_key <- paste(south_edge_list$from_id, south_edge_list$to_id, sep = "-")
+#gg_edges_key <- paste(gg_south_edge_list$from_id, gg_south_edge_list$to_id, sep = "-")
+#rng_edges_key <- paste(rng_south_edge_list$from_id, rng_south_edge_list$to_id, sep = "-")
+#k4_edges_key <- paste(k4_south_edge_list$from_id, k4_south_edge_list$to_id, sep = "-")
+
+##GG lists
+common_roads_gg <- intersect(south_roads_edges_key, gg_edges_key)
+only_roads_gg <- setdiff(south_roads_edges_key, gg_edges_key)
+only_gg_roads <- setdiff(gg_edges_key, south_roads_edges_key)
+
+#To data frames
+common_roads_gg_df <- do.call(rbind, strsplit(common_roads_gg, "-")) %>%
+  as.data.frame() %>%
+  setNames(c("from_id", "to_id"))
+
+only_roads_gg_df <- do.call(rbind, strsplit(only_roads_gg, "-")) %>%
+  as.data.frame() %>%
+  setNames(c("from_id", "to_id"))
+
+only_gg_roads_df <- do.call(rbind, strsplit(only_gg_roads, "-")) %>%
+  as.data.frame() %>%
+  setNames(c("from_id", "to_id"))
+
+##RNG lists
+common_roads_rng <- intersect(south_roads_edges_key, rng_edges_key)
+only_roads_rng <- setdiff(south_roads_edges_key, rng_edges_key)
+only_rng_roads <- setdiff(rng_edges_key, south_roads_edges_key)
+
+#To data frames
+common_roads_rng_df <- do.call(rbind, strsplit(common_roads_rng, "-")) %>%
+  as.data.frame() %>%
+  setNames(c("from_id", "to_id"))
+
+only_roads_rng_df <- do.call(rbind, strsplit(only_roads_rng, "-")) %>%
+  as.data.frame() %>%
+  setNames(c("from_id", "to_id"))
+
+only_rng_roads_df <- do.call(rbind, strsplit(only_rng_roads, "-")) %>%
+  as.data.frame() %>%
+  setNames(c("from_id", "to_id"))
+
+##K=4 NN lists
+common_roads_k4 <- intersect(south_roads_edges_key, k4_edges_key)
+only_roads_k4 <- setdiff(south_roads_edges_key, k4_edges_key)
+only_k4_roads <- setdiff(k4_edges_key, south_roads_edges_key)
+
+#To data frames
+common_roads_k4_df <- do.call(rbind, strsplit(common_roads_k4, "-")) %>%
+  as.data.frame() %>%
+  setNames(c("from_id", "to_id"))
+
+only_roads_k4_df <- do.call(rbind, strsplit(only_roads_k4, "-")) %>%
+  as.data.frame() %>%
+  setNames(c("from_id", "to_id"))
+
+only_k4_roads_df <- do.call(rbind, strsplit(only_k4_roads, "-")) %>%
+  as.data.frame() %>%
+  setNames(c("from_id", "to_id"))
+
+##Add type categories
+common_roads_gg_df$type <- "RoadsGG"
+only_roads_gg_df$type <- "RoadsNoGG"
+only_gg_roads_df$type <- "GGNoRoads"
+
+common_roads_rng_df$type <- "RoadsRNG"
+only_roads_rng_df$type <- "RoadsNoRNG"
+only_rng_roads_df$type <- "RNGNoRoads"
+
+common_roads_k4_df$type <- "RoadsK4"
+only_roads_k4_df$type <- "RoadsNoK4"
+only_k4_roads_df$type <- "K4NoRoads"
+
+#Add to south_edge_list as boolean
+south_edge_list <- south_edge_list %>%
+  mutate(
+    edge_min = pmin(from_id, to_id),
+    edge_max = pmax(from_id, to_id),
+    key = paste(edge_min, edge_max, sep = "-"),
+    commonGG  = key %in% gg_edges_key,
+    commonRNG = key %in% rng_edges_key,
+    commonK4  = key %in% k4_edges_key
+  ) %>%
+  dplyr::select(-edge_min, -edge_max, -key)
+
+##Export
+south_roads_edges <- st_as_sf(south_edge_list)
+st_write(south_roads_edges, "output/south_roads_edges.shp")
+
+#Extract point coordinates into a data frame
+sites_coord <- sites %>%
+  mutate(
+    idAll = as.character(idAll),
+    x = st_coordinates(.)[,1],
+    y = st_coordinates(.)[,2]
+  ) %>%
+  st_drop_geometry()
+
+#Extract edges and add coordinates GG
+gg_south_coord <- gg_south_edge_list %>%
+  left_join(sites_coord, by = c("from_id" = "idAll")) %>%
+  rename(x_from = x, y_from = y) %>%
+  left_join(sites_coord, by = c("to_id" = "idAll")) %>%
+  rename(x_to = x, y_to = y)
+
+gg_south_sf <- gg_south_coord %>%
+  rowwise() %>%
+  mutate(
+    geometry = st_sfc(
+      st_linestring(matrix(c(x_from, x_to, y_from, y_to), ncol = 2, byrow = FALSE)),
+      crs = st_crs(sites)
+    )
+  ) %>%
+  ungroup() %>%
+  st_as_sf()
+
+st_write(gg_south_sf, "output/gg_south.shp")
+
+#Extract edges and add coordinates RNG
+rng_south_coord <- rng_south_edge_list %>%
+  left_join(sites_coord, by = c("from_id" = "idAll")) %>%
+  rename(x_from = x, y_from = y) %>%
+  left_join(sites_coord, by = c("to_id" = "idAll")) %>%
+  rename(x_to = x, y_to = y)
+
+rng_south_sf <- rng_south_coord %>%
+  rowwise() %>%
+  mutate(
+    geometry = st_sfc(
+      st_linestring(matrix(c(x_from, x_to, y_from, y_to), ncol = 2, byrow = FALSE)),
+      crs = st_crs(sites)
+    )
+  ) %>%
+  ungroup() %>%
+  st_as_sf()
+
+st_write(rng_south_sf, "output/rng_south.shp")
+
+#Extract edges and add coordinates RNG
+k4_south_coord <- k4_south_edge_list %>%
+  left_join(sites_coord, by = c("from_id" = "idAll")) %>%
+  rename(x_from = x, y_from = y) %>%
+  left_join(sites_coord, by = c("to_id" = "idAll")) %>%
+  rename(x_to = x, y_to = y)
+
+k4_south_sf <- k4_south_coord %>%
+  rowwise() %>%
+  mutate(
+    geometry = st_sfc(
+      st_linestring(matrix(c(x_from, x_to, y_from, y_to), ncol = 2, byrow = FALSE)),
+      crs = st_crs(sites)
+    )
+  ) %>%
+  ungroup() %>%
+  st_as_sf()
+
+st_write(k4_south_sf, "output/k4_south.shp")
 
 ###Create LCP networks
+
+#Add conductivity surface (for lestcostpath package)
+south_cs75 <- terra::rast("data/levant_conductance_75_south.tif")
+
 #Create conductivity surface with leastcostpath
 south_cs <- leastcostpath::create_cs(south_cs75, neighbours = 16)
