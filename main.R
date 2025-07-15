@@ -13,6 +13,8 @@ library(raster)
 library(sp)
 library(cccd)
 library(gdistance)
+library(leastcostpath)
+library(purrr)
 
 ##Load data, sites=nodes, roads=edges
 sites <- sf::st_read("data/levant_sites.shp")
@@ -734,7 +736,7 @@ south_road_network <- as_sfnetwork(x = south_sites, edges = south_roads_ordered,
 south_road_network_ig <- as.igraph(south_road_network)
 
 ##Get edge list
-# Get vertex attributes (especially idAll)
+#Get vertex attributes (especially idAll)
 node_ids <- south_road_network %>%
   activate("nodes") %>%
   as_tibble() %>%
@@ -842,11 +844,6 @@ rng_edges_key <- sort_edges(rng_south_edge_list) %>%
 k4_edges_key <- sort_edges(k4_south_edge_list) %>%
   mutate(key = paste(edge_min, edge_max, sep = "-")) %>%
   pull(key)
-
-#south_roads_edges_key <- paste(south_edge_list$from_id, south_edge_list$to_id, sep = "-")
-#gg_edges_key <- paste(gg_south_edge_list$from_id, gg_south_edge_list$to_id, sep = "-")
-#rng_edges_key <- paste(rng_south_edge_list$from_id, rng_south_edge_list$to_id, sep = "-")
-#k4_edges_key <- paste(k4_south_edge_list$from_id, k4_south_edge_list$to_id, sep = "-")
 
 ##GG lists
 common_roads_gg <- intersect(south_roads_edges_key, gg_edges_key)
@@ -980,7 +977,7 @@ rng_south_sf <- rng_south_coord %>%
 
 st_write(rng_south_sf, "output/rng_south.shp")
 
-#Extract edges and add coordinates RNG
+#Extract edges and add coordinates K4
 k4_south_coord <- k4_south_edge_list %>%
   left_join(sites_coord, by = c("from_id" = "idAll")) %>%
   rename(x_from = x, y_from = y) %>%
@@ -1003,7 +1000,63 @@ st_write(k4_south_sf, "output/k4_south.shp")
 ###Create LCP networks
 
 #Add conductivity surface (for lestcostpath package)
-south_cs75 <- terra::rast("data/levant_conductance_75_south.tif")
+south_cs90 <- terra::rast("data/levant_conductance_90_south.tif")
 
 #Create conductivity surface with leastcostpath
-south_cs <- leastcostpath::create_cs(south_cs75, neighbours = 16)
+south_cs <- leastcostpath::create_cs(south_cs90, neighbours = 16)
+
+#Create a function for calculating LCP by filtering the south_sites row by row with origin and destinations in edge lists
+calculate_lcp <- function(row, x, sites) {
+  # Get origin and destination points by matching from_id and to_id to idAll
+  origin <- south_sites %>% filter(idAll == row$from_id)
+  destination <- south_sites %>% filter(idAll == row$to_id)
+  #Calculate LCP
+  lcp <- create_lcp(x, origin, destination)
+  # Add from_id to_id to the result
+  lcp$from_id <- row$from_id
+  lcp$to_id <- row$to_id
+  
+  return(lcp)
+}
+
+##LCP network for GG
+gg_lcps_list <- list()
+
+batch_size <- 1
+indices <- seq_len(nrow(gg_south_edge_list))
+batches <- split(indices, ceiling(indices / batch_size))
+
+for (i in seq_along(batches)) {
+  cat("Processing batch", i, "of", length(batches), "\n")
+  
+  batch_results <- map(batches[[i]], function(j) {
+    tryCatch({
+      calculate_lcp(gg_south_edge_list[j, ], x = south_cs, sites = south_sites)
+    }, error = function(e) {
+      message("Error in row ", j, ": ", e$message)
+      return(NULL)
+    })
+  })
+  
+  # Store results and clean memory
+  gg_lcps_list <- c(gg_lcps_list, batch_results)
+  gc(verbose = FALSE)
+}
+
+gg_lcps <- do.call(rbind, gg_lcps_list)
+st_write(gg_lcps, "output/gg_lcps.shp")
+
+##LCP network for RNG
+#Filter GG LCPs (RNG is a subgraph of GG)
+gg_lcps$edge_key <- gg_edges_key
+
+rng_lcps <- gg_lcps %>%
+  filter(edge_key %in% rng_edges_key)
+
+st_write(rng_lcps, "output/rng_lcps.shp")
+
+##LCP network for K=4
+k4_lcps_list <- lapply(1:nrow(k4_south_edge_list), function(i) {
+  calculate_lcp(k4_south_edge_list[i, ], x = south_cs, sites = south_sites)
+})
+k4_lcps <- do.call(rbind, rng_lcps_list)
