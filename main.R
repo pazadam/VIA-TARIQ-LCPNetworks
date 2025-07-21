@@ -1056,7 +1056,15 @@ rng_lcps <- gg_lcps %>%
 st_write(rng_lcps, "output/rng_lcps.shp")
 
 ##LCP network for K=4
-k4_lcps_list <- lapply(1:nrow(k4_south_edge_list), function(i) {
-  calculate_lcp(k4_south_edge_list[i, ], x = south_cs, sites = south_sites)
-})
-k4_lcps <- do.call(rbind, rng_lcps_list)
+#Filter GG LCPs for LCPs contained in K=4
+k4_gg_lcps_common <- gg_lcps %>%
+  filter(edge_key %in% k4_edges_key)
+
+k4_south_edge_list$edge_key <- paste(k4_south_edge_list$from_id, k4_south_edge_list$to_id, sep = "-")
+k4_south_edge_list <- k4_south_edge_list %>%
+  mutate(edge_key = ifelse(from_id < to_id,
+                           paste(from_id, to_id, sep = "-"),
+                           paste(to_id, from_id, sep = "-")))
+
+k4_unique_edges <- k4_south_edge_list %>%
+  filter(!(edge_key %in% gg_edges_key))
