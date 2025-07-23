@@ -1060,11 +1060,58 @@ st_write(rng_lcps, "output/rng_lcps.shp")
 k4_gg_lcps_common <- gg_lcps %>%
   filter(edge_key %in% k4_edges_key)
 
-k4_south_edge_list$edge_key <- paste(k4_south_edge_list$from_id, k4_south_edge_list$to_id, sep = "-")
-k4_south_edge_list <- k4_south_edge_list %>%
-  mutate(edge_key = ifelse(from_id < to_id,
-                           paste(from_id, to_id, sep = "-"),
-                           paste(to_id, from_id, sep = "-")))
+#Create edge key unique to K=4 NN (i.e., excluding edges already contained in GG). K=4 NN contains duplicate edges, so the number of unique edges is lower than would be expected just from looking at the numbers.
+k4_gg_common_key <- k4_gg_lcps_common %>%
+  mutate(
+    edge_min = pmin(from_id, to_id),
+    edge_max = pmax(from_id, to_id),
+    edge_key = paste(edge_min, edge_max, sep = "-")
+  ) %>%
+  pull(edge_key)
 
-k4_unique_edges <- k4_south_edge_list %>%
-  filter(!(edge_key %in% gg_edges_key))
+k4_unique_edges <- setdiff(k4_edges_key, k4_gg_common_key)
+
+k4_unique_edges_df <- data.frame(edge_key = k4_unique_edges) %>%
+  tidyr::separate(edge_key, into = c("from_id", "to_id"), sep = "-", convert = TRUE)
+
+#Calculate K=4 NN unique LCPs
+k4_unique_lcps_list <- list()
+
+batch_size <- 1
+indices <- seq_len(nrow(k4_unique_edges_df))
+batches <- split(indices, ceiling(indices / batch_size))
+
+for (i in seq_along(batches)) {
+  cat("Processing batch", i, "of", length(batches), "\n")
+  
+  batch_results <- map(batches[[i]], function(j) {
+    tryCatch({
+      calculate_lcp(k4_unique_edges_df[j, ], x = south_cs, sites = south_sites)
+    }, error = function(e) {
+      message("Error in row ", j, ": ", e$message)
+      return(NULL)
+    })
+  })
+  
+  # Store results and clean memory
+  k4_unique_lcps_list <- c(k4_unique_lcps_list, batch_results)
+  gc(verbose = FALSE)
+}
+
+k4_unique_lcps <- do.call(rbind, k4_unique_lcps_list)
+
+k4_gg_lcps_common <- k4_gg_lcps_common %>%
+  select(-edge_key)
+
+k4_lcps <- rbind(k4_unique_lcps, k4_gg_lcps_common)
+
+st_write(k4_lcps, "output/k4_lcps.shp")
+
+###Road network and LCP networks comparison
+##Edges in RR and GG/RNG/K4
+
+##Edges in RR not in GG/RNG/K4
+
+##Edges not in RR but in GG/RNG/K4
+
+##NPDI validation
