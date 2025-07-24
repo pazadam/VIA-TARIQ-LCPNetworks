@@ -405,7 +405,7 @@ sites_nodes <- sites_nodes %>%
 write_sf(sites_nodes, "output/sites_nodes.shp")
 
 ###Network comparison
-###We compare the network with theoretical planar networks (Gabriel Graph, Relative Neighbourhood Graph, Minimum Spanning Tree, Delaunay Triangulation)
+###We compare the network with theoretical planar networks (Gabriel Graph, Relative Neighbourhood Graph, Minimum Spanning Tree, Delaunay Triangulation, K=4 Nearest Neighbours)
 
 #Data preparation
 #Sites dataset contains also placeholder nodes at intersections that could not be tied to any archaeological site. For network construction we will exclude these nodes.
@@ -458,8 +458,12 @@ dt_cleaned_edgelist <- dt_cleaned %>%
 
 dt_igraph_cleaned <- graph_from_data_frame(dt_cleaned_edgelist, directed = FALSE)
 
+##K=4 Nearest Neighbours
+k4_c <- spatgraph(nodes_ppp, type = "knn", par = 4)
+k4_c_igraph <- graph_from_adj_list(k4_c$edges, mode = "all", duplicate = FALSE)
+
 ##Add all to list
-constructed_networks <- list(gg = gg_c_igraph, rng = rng_c_igraph, mst = mst_c_igraph, dt = dt_igraph_cleaned)
+constructed_networks <- list(gg = gg_c_igraph, rng = rng_c_igraph, mst = mst_c_igraph, dt = dt_igraph_cleaned, k4 = k4_c_igraph)
 
 ##Calculate properties of the constructed networks
 #Number of edges
@@ -810,11 +814,24 @@ k4_south <- cccd::nng(cd_matrix, k = 4, mutual = FALSE)
 #Extract edge list
 k4_south_edges <- as_data_frame(k4_south, what = "edges")
 
-#Get RNG edge list
+#Get K4 edge list
 k4_south_edges$from_id <- id_map[as.integer(k4_south_edges$from)]
 k4_south_edges$to_id   <- id_map[as.integer(k4_south_edges$to)]
 
 k4_south_edge_list <- k4_south_edges %>%
+  dplyr::select(from_id, to_id)
+
+###Create K=5 Nearest Neighbour Graph
+k5_south <- cccd::nng(cd_matrix, k = 5, mutual = FALSE)
+
+#Extract edge list
+k5_south_edges <- as_data_frame(k5_south, what = "edges")
+
+#Get K4 edge list
+k5_south_edges$from_id <- id_map[as.integer(k5_south_edges$from)]
+k5_south_edges$to_id   <- id_map[as.integer(k5_south_edges$to)]
+
+k5_south_edge_list <- k5_south_edges %>%
   dplyr::select(from_id, to_id)
 
 ###Compare edge lists (common edges, only in road network, only in modeled networks)
@@ -842,6 +859,10 @@ rng_edges_key <- sort_edges(rng_south_edge_list) %>%
   pull(key)
 
 k4_edges_key <- sort_edges(k4_south_edge_list) %>%
+  mutate(key = paste(edge_min, edge_max, sep = "-")) %>%
+  pull(key)
+
+k5_edges_key <- sort_edges(k5_south_edge_list) %>%
   mutate(key = paste(edge_min, edge_max, sep = "-")) %>%
   pull(key)
 
@@ -899,6 +920,24 @@ only_k4_roads_df <- do.call(rbind, strsplit(only_k4_roads, "-")) %>%
   as.data.frame() %>%
   setNames(c("from_id", "to_id"))
 
+##K=5 NN lists
+common_roads_k5 <- intersect(south_roads_edges_key, k5_edges_key)
+only_roads_k5 <- setdiff(south_roads_edges_key, k5_edges_key)
+only_k5_roads <- setdiff(k5_edges_key, south_roads_edges_key)
+
+#To data frames
+common_roads_k5_df <- do.call(rbind, strsplit(common_roads_k5, "-")) %>%
+  as.data.frame() %>%
+  setNames(c("from_id", "to_id"))
+
+only_roads_k5_df <- do.call(rbind, strsplit(only_roads_k5, "-")) %>%
+  as.data.frame() %>%
+  setNames(c("from_id", "to_id"))
+
+only_k5_roads_df <- do.call(rbind, strsplit(only_k5_roads, "-")) %>%
+  as.data.frame() %>%
+  setNames(c("from_id", "to_id"))
+
 ##Add type categories
 common_roads_gg_df$type <- "RoadsGG"
 only_roads_gg_df$type <- "RoadsNoGG"
@@ -912,6 +951,10 @@ common_roads_k4_df$type <- "RoadsK4"
 only_roads_k4_df$type <- "RoadsNoK4"
 only_k4_roads_df$type <- "K4NoRoads"
 
+common_roads_k5_df$type <- "RoadsK5"
+only_roads_k5_df$type <- "RoadsNoK5"
+only_k5_roads_df$type <- "K5NoRoads"
+
 #Add to south_edge_list as boolean
 south_edge_list <- south_edge_list %>%
   mutate(
@@ -920,7 +963,8 @@ south_edge_list <- south_edge_list %>%
     key = paste(edge_min, edge_max, sep = "-"),
     commonGG  = key %in% gg_edges_key,
     commonRNG = key %in% rng_edges_key,
-    commonK4  = key %in% k4_edges_key
+    commonK4  = key %in% k4_edges_key,
+    commonK5 = key %in% k5_edges_key
   ) %>%
   dplyr::select(-edge_min, -edge_max, -key)
 
@@ -928,6 +972,7 @@ south_edge_list <- south_edge_list %>%
 south_roads_edges <- st_as_sf(south_edge_list)
 st_write(south_roads_edges, "output/south_roads_edges.shp")
 
+##Export constructed graphs as straight line sf objects
 #Extract point coordinates into a data frame
 sites_coord <- sites %>%
   mutate(
@@ -996,6 +1041,26 @@ k4_south_sf <- k4_south_coord %>%
   st_as_sf()
 
 st_write(k4_south_sf, "output/k4_south.shp")
+
+#Extract edges and add coordinates K4
+k5_south_coord <- k5_south_edge_list %>%
+  left_join(sites_coord, by = c("from_id" = "idAll")) %>%
+  rename(x_from = x, y_from = y) %>%
+  left_join(sites_coord, by = c("to_id" = "idAll")) %>%
+  rename(x_to = x, y_to = y)
+
+k5_south_sf <- k5_south_coord %>%
+  rowwise() %>%
+  mutate(
+    geometry = st_sfc(
+      st_linestring(matrix(c(x_from, x_to, y_from, y_to), ncol = 2, byrow = FALSE)),
+      crs = st_crs(sites)
+    )
+  ) %>%
+  ungroup() %>%
+  st_as_sf()
+
+st_write(k5_south_sf, "output/k5_south.shp")
 
 ###Create LCP networks
 
@@ -1108,10 +1173,277 @@ k4_lcps <- rbind(k4_unique_lcps, k4_gg_lcps_common)
 st_write(k4_lcps, "output/k4_lcps.shp")
 
 ###Road network and LCP networks comparison
-##Edges in RR and GG/RNG/K4
-
-##Edges in RR not in GG/RNG/K4
-
-##Edges not in RR but in GG/RNG/K4
-
 ##NPDI validation
+
+#RNG NPDI
+#Normalize edge directions (from_id and to_id are often switched between the two compared sf objects)
+common_roads_rng_df <- common_roads_rng_df %>%
+  mutate(
+    edge_min = pmin(from_id, to_id),
+    edge_max = pmax(from_id, to_id)
+  )
+
+rng_lcps <- rng_lcps %>%
+  mutate(
+    edge_min = pmin(from_id, to_id),
+    edge_max = pmax(from_id, to_id)
+  )
+
+south_roads <- south_roads %>%
+  mutate(
+    edge_min = pmin(from_id, to_id),
+    edge_max = pmax(from_id, to_id)
+  )
+
+#Initialize RNG list to store the results
+rng_PDIs <- list()
+
+#Loop through the sf objects using normalized order of the from_id and to_id columns while retaining the original column order and enforcing consistent naming of columns
+desired_cols <- c("area", "pdi", "max_distance", "normalised_pdi", "geometry", "from_id", "to_id")
+
+standardize_cols <- function(df, desired_cols) {
+  #Add missing columns as NA
+  missing <- setdiff(desired_cols, names(df))
+  for (col in missing) {
+    if (col == "geometry") {
+      #Add empty geometry (compatible with sf)
+      df[[col]] <- st_sfc(lapply(1:nrow(df), function(x) st_geometrycollection()), crs = st_crs(df))
+    } else {
+      df[[col]] <- NA
+    }
+  }
+  
+  #Drop extra columns not in desired_cols
+  df <- df[, intersect(desired_cols, names(df)), drop = FALSE]
+  
+  #Reorder to desired_cols order (some columns may still be missing so use intersect again)
+  df <- df[, intersect(desired_cols, names(df))]
+  
+  #If geometry column exists, ensure it's class "sfc"
+  if ("geometry" %in% names(df)) {
+    if (!inherits(df$geometry, "sfc")) {
+      df$geometry <- st_sfc(df$geometry, crs = st_crs(df))
+    }
+  }
+  
+  return(df)
+}
+
+for (i in 1:nrow(common_roads_rng_df)) {
+  from_id <- common_roads_rng_df$from_id[i]
+  to_id <- common_roads_rng_df$to_id[i]
+  origin_ <- common_roads_rng_df$edge_min[i]
+  destination <- common_roads_rng_df$edge_max[i]
+  
+  subset_rng <- rng_lcps %>%
+    filter(edge_min == origin_ & edge_max == destination)
+  
+  subset_south_roads <- south_roads %>%
+    filter(edge_min == origin_ & edge_max == destination)
+  
+  valid_input <- (
+    nrow(subset_rng) > 0 &&
+      nrow(subset_south_roads) > 0 &&
+      all(st_is_valid(subset_rng)) &&
+      all(st_is_valid(subset_south_roads)) &&
+      length(st_geometry(subset_rng)) > 0 &&
+      length(st_geometry(subset_south_roads)) > 0
+  )
+  
+  if (valid_input) {
+    tryCatch({
+      rng_pdi_results <- leastcostpath::PDI_validation(
+        lcp = subset_rng,
+        comparison = subset_south_roads
+      )
+      
+      #Add original IDs to the result
+      rng_pdi_results$from_id <- from_id
+      rng_pdi_results$to_id <- to_id
+      
+      #Standardize columns and reorder
+      rng_pdi_results <- standardize_cols(rng_pdi_results, desired_cols)
+      
+      rng_PDIs[[paste(from_id, to_id, sep = "_")]] <- rng_pdi_results
+    }, error = function(e) {
+      message("Error in PDI_validation for ", from_id, "-", to_id, ": ", e$message)
+    })
+  } else {
+    message("Skipping ", from_id, "-", to_id, ": missing or invalid input")
+  }
+}
+
+rng_PDI_validation <- do.call(rbind, rng_PDIs)
+sf::st_write(rng_PDI_validation, "output/rng_PDI_validation.shp")
+
+#GG NPDI validation
+common_roads_gg_df <- common_roads_gg_df %>%
+  mutate(
+    edge_min = pmin(from_id, to_id),
+    edge_max = pmax(from_id, to_id)
+  )
+
+gg_lcps <- gg_lcps %>%
+  mutate(
+    edge_min = pmin(from_id, to_id),
+    edge_max = pmax(from_id, to_id)
+  )
+
+
+gg_PDIs <- list()
+
+for (i in 1:nrow(common_roads_gg_df)) {
+  from_id <- common_roads_gg_df$from_id[i]
+  to_id <- common_roads_gg_df$to_id[i]
+  origin_ <- common_roads_gg_df$edge_min[i]
+  destination <- common_roads_gg_df$edge_max[i]
+  
+  subset_gg <- gg_lcps %>%
+    filter(edge_min == origin_ & edge_max == destination)
+  
+  subset_south_roads <- south_roads %>%
+    filter(edge_min == origin_ & edge_max == destination)
+  
+  valid_input <- (
+    nrow(subset_gg) > 0 &&
+      nrow(subset_south_roads) > 0 &&
+      all(st_is_valid(subset_gg)) &&
+      all(st_is_valid(subset_south_roads)) &&
+      length(st_geometry(subset_gg)) > 0 &&
+      length(st_geometry(subset_south_roads)) > 0
+  )
+  
+  if (valid_input) {
+    tryCatch({
+      gg_pdi_results <- leastcostpath::PDI_validation(
+        lcp = subset_gg,
+        comparison = subset_south_roads
+      )
+      
+      #Add original IDs to the result
+      gg_pdi_results$from_id <- from_id
+      gg_pdi_results$to_id <- to_id
+      
+      #Standardize columns and reorder
+      gg_pdi_results <- standardize_cols(gg_pdi_results, desired_cols)
+      
+      gg_PDIs[[paste(from_id, to_id, sep = "_")]] <- gg_pdi_results
+    }, error = function(e) {
+      message("Error in PDI_validation for ", from_id, "-", to_id, ": ", e$message)
+    })
+  } else {
+    message("Skipping ", from_id, "-", to_id, ": missing or invalid input")
+  }
+}
+
+gg_PDI_validation <- do.call(rbind, gg_PDIs)
+sf::st_write(gg_PDI_validation, "output/gg_PDI_validation.shp")
+
+#K=4 NN NPDI
+common_roads_k4_df <- common_roads_k4_df %>%
+  mutate(
+    edge_min = pmin(from_id, to_id),
+    edge_max = pmax(from_id, to_id)
+  )
+
+k4_lcps <- k4_lcps %>%
+  mutate(
+    edge_min = pmin(from_id, to_id),
+    edge_max = pmax(from_id, to_id)
+  )
+
+
+k4_PDIs <- list()
+
+for (i in 1:nrow(common_roads_k4_df)) {
+  from_id <- common_roads_k4_df$from_id[i]
+  to_id <- common_roads_k4_df$to_id[i]
+  origin_ <- common_roads_k4_df$edge_min[i]
+  destination <- common_roads_k4_df$edge_max[i]
+  
+  subset_k4 <- k4_lcps %>%
+    filter(edge_min == origin_ & edge_max == destination)
+  
+  subset_south_roads <- south_roads %>%
+    filter(edge_min == origin_ & edge_max == destination)
+  
+  valid_input <- (
+    nrow(subset_k4) > 0 &&
+      nrow(subset_south_roads) > 0 &&
+      all(st_is_valid(subset_k4)) &&
+      all(st_is_valid(subset_south_roads)) &&
+      length(st_geometry(subset_k4)) > 0 &&
+      length(st_geometry(subset_south_roads)) > 0
+  )
+  
+  if (valid_input) {
+    tryCatch({
+      k4_pdi_results <- leastcostpath::PDI_validation(
+        lcp = subset_k4,
+        comparison = subset_south_roads
+      )
+      
+      #Add original IDs to the result
+      k4_pdi_results$from_id <- from_id
+      k4_pdi_results$to_id <- to_id
+      
+      #Standardize columns and reorder
+      k4_pdi_results <- standardize_cols(k4_pdi_results, desired_cols)
+      
+      k4_PDIs[[paste(from_id, to_id, sep = "_")]] <- k4_pdi_results
+    }, error = function(e) {
+      message("Error in PDI_validation for ", from_id, "-", to_id, ": ", e$message)
+    })
+  } else {
+    message("Skipping ", from_id, "-", to_id, ": missing or invalid input")
+  }
+}
+
+k4_PDI_validation <- do.call(rbind, k4_PDIs)
+sf::st_write(k4_PDI_validation, "output/k4_PDI_validation.shp")
+
+##Table comparing mean, median, min, max NPDI
+#Distinct npdi column and transform to data frame
+rng_npdi <- rng_PDI_validation %>%
+  st_drop_geometry() %>%
+  rename(npdi = normalised_pdi) %>%
+  dplyr::select(npdi) %>%
+  distinct()
+
+gg_npdi <- gg_PDI_validation %>%
+  st_drop_geometry() %>%
+  rename(npdi = normalised_pdi) %>%
+  dplyr::select(npdi) %>%
+  distinct()
+
+k4_npdi <- k4_PDI_validation %>%
+  st_drop_geometry() %>%
+  rename(npdi = normalised_pdi) %>%
+  dplyr::select(npdi) %>%
+  distinct()
+
+#Calculate values
+rng_npdi_stats <- rng_npdi %>%
+  summarise( 
+            mean = mean(npdi, na.rm = TRUE),
+            median = median(npdi, na.rm = TRUE),
+            min = min(npdi, na.rm = TRUE),
+            max = max(npdi, na.rm = TRUE))
+
+gg_npdi_stats <- gg_npdi %>%
+  summarise( 
+    mean = mean(npdi, na.rm = TRUE),
+    median = median(npdi, na.rm = TRUE),
+    min = min(npdi, na.rm = TRUE),
+    max = max(npdi, na.rm = TRUE))
+
+k4_npdi_stats <- k4_npdi %>%
+  summarise( 
+    mean = mean(npdi, na.rm = TRUE),
+    median = median(npdi, na.rm = TRUE),
+    min = min(npdi, na.rm = TRUE),
+    max = max(npdi, na.rm = TRUE))
+
+#To table
+npdi_table <- bind_rows(rng_npdi_stats, gg_npdi_stats, k4_npdi_stats)
+rownames(npdi_table) <- c("RNG", "GG", "K4")
