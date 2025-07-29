@@ -1062,6 +1062,7 @@ k5_south_sf <- k5_south_coord %>%
 
 st_write(k5_south_sf, "output/k5_south.shp")
 
+################################################################################
 ###Create LCP networks
 
 #Add conductivity surface (for lestcostpath package)
@@ -1077,7 +1078,7 @@ calculate_lcp <- function(row, x, sites) {
   destination <- south_sites %>% filter(idAll == row$to_id)
   #Calculate LCP
   lcp <- create_lcp(x, origin, destination)
-  # Add from_id to_id to the result
+  #Add from_id to_id to the result
   lcp$from_id <- row$from_id
   lcp$to_id <- row$to_id
   
@@ -1172,7 +1173,8 @@ k4_lcps <- rbind(k4_unique_lcps, k4_gg_lcps_common)
 
 st_write(k4_lcps, "output/k4_lcps.shp")
 
-###Road network and LCP networks comparison
+################################################################################
+####Road network and LCP networks comparison
 ##NPDI validation
 
 #RNG NPDI
@@ -1447,3 +1449,217 @@ k4_npdi_stats <- k4_npdi %>%
 #To table
 npdi_table <- bind_rows(rng_npdi_stats, gg_npdi_stats, k4_npdi_stats)
 rownames(npdi_table) <- c("RNG", "GG", "K4")
+
+###Network properties of the southern Levant road network and the LCP networks
+
+##Add networks to list
+road_lcp_networks <- list(roman_south = south_road_network_ig, rng_lcp = rng_south, gg_lcp = gg_south, k4_lcp = k4_south)
+
+##Calculate properties of the constructed networks
+#Number of edges
+south_number_of_edges_df <- road_lcp_networks %>% 
+  lapply(ecount) %>%
+  stack() %>%
+  dplyr::select(ind, values) %>%
+  setNames(c("network","number_of_edges"))
+
+#Degree
+south_degree_df <- road_lcp_networks %>% 
+  lapply(degree) %>%
+  lapply(mean) %>%
+  stack() %>%
+  dplyr::select(ind, values) %>%
+  setNames(c("network","avg_degree"))
+
+#Density
+south_density_df <- road_lcp_networks %>%
+  lapply(edge_density) %>%
+  stack() %>%
+  dplyr::select(ind, values) %>%
+  setNames(c("network","density"))
+
+#Gamma index
+south_gamma_df <- road_lcp_networks %>%
+  lapply(function(g) {
+    ecount(g)/(3*(vcount(g)-2))
+  }) %>%
+  stack() %>%
+  dplyr::select(ind, values) %>%
+  setNames(c("network","gamma_index"))
+
+#Alpha index
+south_alpha_values <- road_lcp_networks %>%
+  lapply(function(g) {
+    (ecount(g)-vcount(g)+1)/(2*vcount(g)-5)
+  }) %>%
+  stack() %>%
+  dplyr::select(ind, values) %>%
+  setNames(c("network","alpha_index"))
+
+#south_alpha_values <- sapply(names(road_lcp_networks), function(nm) {
+#  g <- constructed_networks[[nm]]
+#  if (grepl("mst", nm, ignore.case = TRUE)) {
+#    NA
+#  } else {
+#    (ecount(g)-vcount(g)+1)/(2*vcount(g)-5)
+#  }
+#}
+#)
+
+#south_alpha_df <- data.frame(
+#  network = names(south_alpha_values),
+#  alpha_index = south_alpha_values
+#)
+
+#Clustering coefficient global
+south_ccg_values <- sapply(names(road_lcp_networks), function(nm) {
+  if (grepl("rng_lcp", nm, ignore.case = TRUE)) {
+    NA_real_
+  } else {
+    transitivity(road_lcp_networks[[nm]], type = "global")
+  }
+})
+
+south_ccg_df <- data.frame(
+  network = names(south_ccg_values),
+  ccg = south_ccg_values
+)
+
+#Clustering coefficient local
+south_ccl_values <- sapply(names(road_lcp_networks), function(nm) {
+  if (grepl("rng_lcp", nm, ignore.case = TRUE)) {
+    NA_real_
+  } else {
+    transitivity(road_lcp_networks[[nm]], type = "average")
+  }
+})
+
+south_ccl_df <- data.frame(
+  network = names(south_ccl_values),
+  ccl = south_ccl_values
+)
+
+#Combine tables
+road_lcp_networks_table <- south_number_of_edges_df %>%
+  left_join(south_degree_df, by = "network") %>%
+  left_join(south_density_df, by = "network") %>%
+  left_join(south_gamma_df, by = "network") %>%
+  left_join(south_alpha_values, by = "network") %>%
+  left_join(south_ccg_df, by = "network") %>%
+  left_join(south_ccl_df, by = "network")
+
+write.csv(road_lcp_networks_table, "output/road_lcp_networks_table.csv")
+
+##########################################################################################
+###Caroll and Caroll road network construction method
+#We will use cd_matrix for connecting the sites, but first we will need a time-distance matrix to filter sites by maximum time-distance.
+#For that we calculate time-based conductivity surface based on Tobler's function which will be used to calculate new transitivity surface to use as an input for time-distance matrix.
+
+south_dem <- terra::rast("data/south_levant_90m.tif")
+south_dem_rast <- raster::raster("data/south_levant_90m.tif")
+
+south_cs_tobler <- leastcostpath::create_slope_cs(south_dem, cost_function = "tobler", neighbours = 16)
+
+#Create an empty transitivity layer that will be populated with values from south_cs_tobler
+south_tobler_tr <- gdistance::transition(south_dem_rast, transitionFunction = function(x) 1, directions = 16)
+south_tobler_tr@transitionMatrix <- south_cs_tobler$conductanceMatrix
+south_tobler_tr@matrixValues <- "transitionMatrix"
+
+#Calculate time-distance matrix
+cd_time <- gdistance::costDistance(south_tobler_tr, south_sites_sp)
+cd_time_matrix <- as.matrix(cd_time)
+
+#Set parameters:
+#Time cutoff: 6 hours (21600 seconds), ca. half-day of walking to limit the neighbourhood. One site in Negev is likely to be isolated.
+#Lambda parameter: could be anywhere between 0.1-infinity, represents ratio between travelling costs and building/maintenance costs. Lambda <1 signify high building/maintenance costs resulting in fewer roads. Carroll and Carroll suggest L=7 gives best results, so we start with L=7
+
+time_cutoff <- 21600
+L <- 7
+
+#Output list of sfnetworks
+network_list <- list()
+
+#Start timer
+start_time <- Sys.time()
+
+#Loop through each site (row index in cd_time)
+for (i in seq_len(nrow(cd_time_matrix))) {
+  
+  message("Processing site ", i, "/", nrow(cd_time_matrix), " ...")
+  
+  # Step 1: Identify reachable sites within 6 hours
+  reachable_idx <- which(cd_time_matrix[i, ] <= time_cutoff & !is.infinite(cd_time[i, ]))
+  
+  message("  - Found ", length(reachable_idx), " reachable sites")
+  
+  # Skip if only self or too few reachable
+  if (length(reachable_idx) < 2) {
+    message("  - Skipped: not enough reachable sites")
+    next
+  }
+  
+  # Step 2: Subset site geometries
+  subset_sites <- south_sites[reachable_idx, ]
+  subset_ids <- reachable_idx
+  
+  # Step 3: Extract submatrix of cd_matrix for these sites
+  subset_cd <- as.matrix(cd_matrix)[subset_ids, subset_ids]
+  
+  # Step 4: Convert sites to sfnetwork nodes
+  net <- as_sfnetwork(subset_sites, directed = FALSE)
+  
+  # Step 5: Create edges from all-to-all pairs and assign weights
+  edge_list <- t(combn(seq_len(nrow(subset_cd)), 2))
+  edges_df <- data.frame(
+    from = edge_list[, 1],
+    to = edge_list[, 2],
+    weight = subset_cd[edge_list]
+  )
+  
+  # Add reverse edges for undirected graph
+  edges_df_rev <- edges_df %>% rename(from = to, to = from)
+  edges_all <- bind_rows(edges_df, edges_df_rev)
+  
+  net <- net %>% activate("edges") %>%
+    bind_rows(as_tibble(edges_all)) %>%
+    st_as_sfnetwork(directed = FALSE)
+  
+  # Step 6: Prune edges based on inequality: XZ(1 + 1/L) < XY + YZ
+  message("  - Pruning edges...")
+  
+  net <- net %>%
+    activate("edges") %>%
+    mutate(keep = map_lgl(row_number(), function(e_idx) {
+      edge <- .E()[e_idx, ]
+      X <- edge$from
+      Z <- edge$to
+      XZ <- edge$weight
+      
+      # Check for violations with intermediates
+      node_ids <- unique(c(edges_df$from, edges_df$to))
+      intermediates <- setdiff(node_ids, c(X, Z))
+      
+      any_violation <- any(sapply(intermediates, function(Y) {
+        XY <- subset_cd[X, Y]
+        YZ <- subset_cd[Y, Z]
+        if (is.infinite(XY) || is.infinite(YZ)) return(FALSE)
+        return(XZ * (1 + 1/L) < XY + YZ)
+      }))
+      
+      return(any_violation)
+    })) %>%
+    filter(keep) %>%
+    select(-keep)
+  
+  message("  - Final edge count: ", nrow(as_tibble(net, "edges")))
+  
+  # Step 7: Store the final sfnetwork
+  network_list[[i]] <- net
+  
+  # Time estimate
+  elapsed <- difftime(Sys.time(), start_time, units = "secs")
+  avg_time <- as.numeric(elapsed) / i
+  remaining <- round(avg_time * (nrow(cd_time) - i))
+  
+  message("  - Done. Est. time remaining: ", round(remaining / 60, 1), " min\n")
+}
