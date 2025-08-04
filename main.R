@@ -1933,3 +1933,126 @@ GG_unique_lcps <- gg_lcps %>%
 L4_GG_lcps <- rbind(L4_lcps, GG_unique_lcps)
 
 st_write(L4_GG_lcps, "output/L4_GG_lcps.shp")
+
+###########################################################################
+###### Road network construction from trunk roads
+###########################################################################
+###First, we build a network of 'trunk' long-distance roads connecting major cities, then settlements are connected to these trunk roads using Carroll and Carroll method with L=4.
+###Major cities are connected using K=4 Nearest Neighbour method
+
+#Get city nodes from south_sites
+south_cities <- south_sites %>%
+  filter(featureTyp %in% c("city")) %>%
+  mutate(x = st_coordinates(.)[, 1],
+         y = st_coordinates(.)[, 2]) %>%
+  st_drop_geometry() %>%
+  select(idAll, x, y) %>%
+  na.omit() %>%
+  distinct()
+
+cities_ppp <- ppp(x = south_cities$x,
+                  y = south_cities$y,
+                  window = b_box_owin,
+                  marks = south_cities$idAll)
+
+#Calculate K=4 NN for cities
+k4_cities <- spatgraph(cities_ppp, type = "knn", par = 4)
+
+k4_cities_ig <- graph_from_adj_list(k4_cities$edges, mode = "all", duplicate = FALSE)
+
+#Get edge list, map idAll to from_id and to_id fields
+k4_cities_edges <- igraph::as_data_frame(k4_cities_ig, what = "edges")
+
+south_cities <- south_sites %>%
+  filter(featureTyp %in% c("city"))
+
+id_map_cities <- south_cities$idAll
+
+k4_cities_edges$from_id <- id_map_cities[as.integer(k4_cities_edges$from)]
+k4_cities_edges$to_id <- id_map_cities[as.integer(k4_cities_edges$to)]
+
+k4_cities_edge_list <- k4_cities_edges %>%
+  dplyr::select(from_id, to_id)
+
+k4_cities_edge_list <- k4_cities_edge_list %>%
+  mutate(
+    edge_min = pmin(from_id, to_id),
+    edge_max = pmax(from_id, to_id)
+  ) %>%
+  distinct(edge_min, edge_max) %>%
+  rename(from_id = edge_min, to_id = edge_max)
+
+##LCP network for K=4 cities
+k4cities_lcps_list <- list()
+
+batch_size <- 1
+indices <- seq_len(nrow(k4_cities_edge_list))
+batches <- split(indices, ceiling(indices / batch_size))
+
+for (i in seq_along(batches)) {
+  cat("Processing batch", i, "of", length(batches), "\n")
+  
+  batch_results <- map(batches[[i]], function(j) {
+    tryCatch({
+      calculate_lcp(k4_cities_edge_list[j, ], x = south_cs, sites = south_cities)
+    }, error = function(e) {
+      message("Error in row ", j, ": ", e$message)
+      return(NULL)
+    })
+  })
+  
+  # Store results and clean memory
+  k4cities_lcps_list <- c(k4cities_lcps_list, batch_results)
+  gc(verbose = FALSE)
+}
+
+k4cities_lcps <- do.call(rbind, k4cities_lcps_list)
+k4cities_lcps %>% st_set_crs(3395)
+st_write(k4cities_lcps, "output/k4cities_lcps.shp")
+
+### Sample points are made on trunk roads (K=4 NN connecting cities) every 2 km, where LCPs overlap only one set of points is retained.
+sample_points <- st_line_sample(k4cities_lcps, density = 1/2000)
+
+sample_points_sf <- st_sf(geometry = sample_points)
+
+coords <- st_coordinates(sample_points)
+
+#Convert coordinates to POINT geometries
+sample_points_flat <- st_as_sf(
+  as.data.frame(coords),
+  coords = c("X", "Y"),
+  crs = st_crs(k4cities_lcps)
+) %>%
+  mutate(id = row_number()) %>%
+  select(-L1)
+
+#Find points within 2000m and filter unique points
+within_3000m <- st_is_within_distance(sample_points_flat, sample_points_flat, dist = 3000, sparse = FALSE)
+
+n <- nrow(sample_points_flat)
+keep <- rep(TRUE, n)
+
+for (i in seq_len(n)) {
+  if (!keep[i]) next
+  
+  neighbors_to_remove <- which(within_3000m[i, ] & seq_len(n) > i)
+  
+  if (length(neighbors_to_remove) > 0) {
+    keep[neighbors_to_remove] <- FALSE
+  }
+}
+
+unique_sample_points <- sample_points_flat[keep, ]
+
+st_write(unique_sample_points, "output/unique_sample_points.shp")
+
+#Cost distance matrix for cities and settlements
+south_sites_sel <- south_sites %>%
+  filter(featureTyp %in% c("city", "settlement"))
+
+south_sites_sel_sp <- as(south_sites_sel, "Spatial")
+
+cd_a <- gdistance::costDistance(tr, south_sites_sel_sp)
+cd_a_matrix <- as.matrix(cd_a)
+
+#Cost distance matrix for cities, settlements, and LCP points
