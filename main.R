@@ -2055,4 +2055,33 @@ south_sites_sel_sp <- as(south_sites_sel, "Spatial")
 cd_a <- gdistance::costDistance(tr, south_sites_sel_sp)
 cd_a_matrix <- as.matrix(cd_a)
 
+id_vector_a <- south_sites_sel$idAll
+
+rownames(cd_a_matrix) <- id_vector_a
+colnames(cd_a_matrix) <- id_vector_a
+
 #Cost distance matrix for cities, settlements, and LCP points
+#Add idAll and sequential numbering starting with 1015 (last idAll of south_sites_sel is 1014) to unique_sample_points
+sample_points_id <- unique_sample_points %>%
+  dplyr::select(-cluster_id) %>%
+  rename(idAll = id) %>%
+  mutate(idAll = 1014 + row_number())
+
+#Merge with south_sites_sel (sample_points_id does not have the same columns, so these are appended and filed with NA)
+missing_cols <- setdiff(names(south_sites_sel), names(sample_points_id))
+sample_points_id[missing_cols] <- NA
+
+sample_points_id <- sample_points_id[, names(south_sites_sel)]
+
+south_sites_sam <- rbind(south_sites_sel, sample_points_id)
+
+#Calculate cost distance matrix
+south_sites_sam_sp <- as(south_sites_sam, "Spatial")
+
+cd_b <- gdistance::costDistance(tr, south_sites_sam_sp)
+cd_b_matrix <- as.matrix(cd_b)
+
+id_vector_b <- south_sites_sam$idAll
+
+rownames(cd_b_matrix) <- id_vector_b
+colnames(cd_b_matrix) <- id_vector_b
