@@ -2047,18 +2047,18 @@ unique_sample_points <- sample_points_flat[keep, ]
 st_write(unique_sample_points, "output/unique_sample_points.shp")
 
 #Cost distance matrix for cities and settlements
-south_sites_sel <- south_sites %>%
-  filter(featureTyp %in% c("city", "settlement"))
-
-south_sites_sel_sp <- as(south_sites_sel, "Spatial")
-
-cd_a <- gdistance::costDistance(tr, south_sites_sel_sp)
-cd_a_matrix <- as.matrix(cd_a)
-
-id_vector_a <- south_sites_sel$idAll
-
-rownames(cd_a_matrix) <- id_vector_a
-colnames(cd_a_matrix) <- id_vector_a
+#south_sites_sel <- south_sites %>%
+#  filter(featureTyp %in% c("city", "settlement"))
+#
+#south_sites_sel_sp <- as(south_sites_sel, "Spatial")
+#
+#cd_a <- gdistance::costDistance(tr, south_sites_sel_sp)
+#cd_a_matrix <- as.matrix(cd_a)
+#
+#id_vector_a <- south_sites_sel$idAll
+#
+#rownames(cd_a_matrix) <- id_vector_a
+#colnames(cd_a_matrix) <- id_vector_a
 
 #Cost distance matrix for cities, settlements, and LCP points
 #Add idAll and sequential numbering starting with 1015 (last idAll of south_sites_sel is 1014) to unique_sample_points
@@ -2085,3 +2085,200 @@ id_vector_b <- south_sites_sam$idAll
 
 rownames(cd_b_matrix) <- id_vector_b
 colnames(cd_b_matrix) <- id_vector_b
+
+#Get time distance matrix for the sites and points sample
+cd_time_b <- gdistance::costDistance(south_tobler_tr, south_sites_sam_sp)
+cd_time_matrix_b <- as.matrix(cd_time_b)
+
+rownames(cd_time_matrix_b) <- id_vector_b
+colnames(cd_time_matrix_b) <- id_vector_b
+
+#Get row indices of categories "city" and "settlement" in south_sites_sel
+idx_by_type <- split(seq_len(nrow(south_sites_sel)), south_sites_sel$featureTyp)
+
+city_indices <- idx_by_type[["city"]]
+settlement_indices <- idx_by_type[["settlement"]]
+
+####To build a basal long-distance network between cities, we first connect cities within specified temporal threshold (7 hours, 25200 seconds, cca. 35 km on flat ground with Tobler's function).
+####In the next step, complete network containing all cities and settlements is built using Delaunay triangulation.Time-distance is added as an edge weight.
+####Shortest paths between cities are then calculated using Dijkstra's algorithm and the network is pruned accordingly.
+city_ids <- rownames(cd_time_matrix_b)[city_indices]
+site_ids <- as.character(south_sites_sel$idAll)
+
+#Get time-distance matrix for cities
+city_matrix <- cd_time_matrix_b[city_ids, city_ids]
+
+#Get edges below the threshold
+city_edges <- which(city_matrix <= 25200 & city_matrix > 0, arr.ind = TRUE)
+city_edges <- city_edges[city_edges[,1] < city_edges[,2], ]
+
+city_edge_list <- data.frame(
+  from = city_ids[city_edges[,1]],
+  to   = city_ids[city_edges[,2]],
+  weight = city_matrix[city_edges]
+)
+
+g_cities <- graph_from_data_frame(city_edge_names, directed = FALSE, vertices = site_ids)
+
+#Delaunay triangulation for cities and settlements
+coords_sites <- st_coordinates(south_sites_sel)
+
+del_sites <- deldir(coords_sites[,1], coords_sites[,2])
+del_sites_edges <- as.data.frame(del_sites$delsgs[, c("ind1", "ind2")]) %>%
+  mutate(
+    from = site_ids[ind1],
+    to   = site_ids[ind2]
+  ) %>%
+  select(from, to)
+
+del_sites_edges$weight <- mapply(
+  function(a, b) cd_time_matrix_b[a, b],
+  del_sites_edges$from,
+  del_sites_edges$to
+)
+  
+#Next we need to prune the edges at the extremes of the graph crossing water/desert, this is done manually in GIS
+#Export graph to shp
+sites_sel_coord <- south_sites_sel %>%
+  mutate(
+    idAll = as.character(idAll),
+    x = st_coordinates(.)[,1],
+    y = st_coordinates(.)[,2]
+  ) %>%
+  st_drop_geometry()
+
+#Extract edges and add coordinates
+del_sites_edges_coord <- del_sites_edges %>%
+  left_join(sites_sel_coord, by = c("from" = "idAll")) %>%
+  rename(x_from = x, y_from = y) %>%
+  left_join(sites_sel_coord, by = c("to" = "idAll")) %>%
+  rename(x_to = x, y_to = y)
+
+del_sites_edges_sf <- del_sites_edges_coord %>%
+  rowwise() %>%
+  mutate(
+    geometry = st_sfc(
+      st_linestring(matrix(c(x_from, y_from, x_to, y_to), ncol = 2, byrow = TRUE)),
+      crs = st_crs(south_sites_sel)
+    )
+  ) %>%
+  ungroup() %>%
+  st_as_sf()
+
+st_write(del_sites_edges_sf, "output/del_sites_edges_sf.shp")
+
+#Import pruned Delaunay graph
+delaunay_pruned <- st_read("data/delaunay_pruned.shp")
+
+#To dataframe
+delaunay_df <- delaunay_pruned %>%
+  st_drop_geometry() %>%
+  as.data.frame() %>%
+  rename(from = from_) %>%
+  mutate(weight = as.numeric(gsub(",", ".", weight)))
+
+#Build graph
+delaunay_sites <- graph_from_data_frame(delaunay_df, directed = FALSE, vertices = site_ids)
+
+#Merge graphs
+combined_network <- igraph::union(g_cities, delaunay_sites, byname = TRUE)
+
+edge_ends <- ends(combined_network, es = E(combined_network))
+E(combined_network)$weight <- mapply(
+  function(a, b) cd_time_matrix_b[a, b],
+  edge_ends[,1],
+  edge_ends[,2]
+)
+
+#Find shortest path, run Dijkstra for each city to city
+E(combined_network)$keep <- FALSE
+
+for (source_city in city_ids) {
+  #Nearest cities
+  dist_vec <- cd_time_matrix_b[source_city, city_ids]
+  dist_vec <- dist_vec[dist_vec > 0]
+  nearest_cities <- names(sort(dist_vec))[1:6]  #Only cities, 6 neighbours is a maximum for a planar graph
+  
+  #Nearby nodes within threshold
+  nearby_nodes <- names(which(cd_time_matrix_b[source_city, ] <= 105000)) #Threshold defined by the longest interval needed for Petra to be connected.
+  nearby_nodes <- intersect(as.character(nearby_nodes), V(combined_network)$name)
+  if (length(nearby_nodes) == 0) next
+  
+  sg <- induced_subgraph(combined_network, vids = nearby_nodes)
+  
+  nearest_in_sg <- intersect(nearest_cities, nearby_nodes)
+  if (length(nearest_in_sg) == 0) next
+  
+  sp <- shortest_paths(
+    sg,
+    from = source_city,
+    to = nearest_in_sg,
+    weights = E(sg)$weight,
+    output = "vpath"
+  )$vpath
+  
+  for (path in sp) {
+    if (length(path) > 1) {
+      verts <- V(sg)[path]$name
+      edge_pairs <- cbind(head(verts, -1), tail(verts, -1))
+      eids <- get.edge.ids(combined_network, t(edge_pairs))
+      E(combined_network)$keep[eids] <- TRUE
+    }
+  }
+}
+
+trunk_network <- subgraph_from_edges(combined_network, E(combined_network)[keep])
+
+#Export
+trunk_edges <- igraph::as_data_frame(trunk_network, what = "edges")
+
+#Extract edges and add coordinates GG
+trunk_edges_coord <- trunk_edges %>%
+  left_join(sites_sel_coord, by = c("from" = "idAll")) %>%
+  rename(x_from = x, y_from = y) %>%
+  left_join(sites_sel_coord, by = c("to" = "idAll")) %>%
+  rename(x_to = x, y_to = y)
+
+trunk_edges_sf <- trunk_edges_coord %>%
+  rowwise() %>%
+  mutate(
+    geometry = st_sfc(
+      st_linestring(matrix(c(x_from, y_from, x_to, y_to), ncol = 2, byrow = TRUE)),
+      crs = st_crs(south_sites_sel)
+    )
+  ) %>%
+  ungroup() %>%
+  st_as_sf()
+
+st_write(trunk_edges_sf, "output/trunk_edges.shp")
+
+#Create LCPs based on the trunk edges
+trunk_edges <- trunk_edges %>%
+  rename(from_id = from, to_id = to)
+
+trunk_edges_lcps_list <- list()
+
+batch_size <- 1
+indices <- seq_len(nrow(trunk_edges))
+batches <- split(indices, ceiling(indices / batch_size))
+
+for (i in seq_along(batches)) {
+  cat("Processing batch", i, "of", length(batches), "\n")
+  
+  batch_results <- map(batches[[i]], function(j) {
+    tryCatch({
+      calculate_lcp(trunk_edges[j, ], x = south_cs, sites = south_sites_sel)
+    }, error = function(e) {
+      message("Error in row ", j, ": ", e$message)
+      return(NULL)
+    })
+  })
+  
+  # Store results and clean memory
+  trunk_edges_lcps_list <- c(trunk_edges_lcps_list, batch_results)
+  gc(verbose = FALSE)
+}
+
+trunk_edges_lcps <- do.call(rbind, trunk_edges_lcps_list)
+trunk_edges_lcps %>% st_set_crs(3395)
+st_write(trunk_edges_lcps, "output/trunk_edges_lcps.shp")
