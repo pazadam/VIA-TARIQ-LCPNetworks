@@ -4,6 +4,7 @@ library(sf)
 library(sfnetworks)
 library(tidygraph)
 library(dplyr)
+library(tidyr)
 library(igraph)
 library(ggplot2)
 library(spatgraphs)
@@ -827,7 +828,7 @@ k5_south <- cccd::nng(cd_matrix, k = 5, mutual = FALSE)
 #Extract edge list
 k5_south_edges <- as_data_frame(k5_south, what = "edges")
 
-#Get K4 edge list
+#Get K5 edge list
 k5_south_edges$from_id <- id_map[as.integer(k5_south_edges$from)]
 k5_south_edges$to_id   <- id_map[as.integer(k5_south_edges$to)]
 
@@ -1555,7 +1556,7 @@ cd_time <- gdistance::costDistance(south_tobler_tr, south_sites_sp)
 cd_time_matrix <- as.matrix(cd_time)
 
 #Set parameters:
-#Time cutoff: 12 hours (43200 seconds), ca. 1/day of walking to limit the neighbourhood. One site in Negev is likely to be isolated.
+#Time cutoff: 12 hours (43200 seconds), ca. 1 day of walking to limit the neighbourhood. One site in Negev is likely to be isolated.
 #Lambda parameter: could be anywhere between 0.1-infinity, represents ratio between travelling costs and building/maintenance costs. Lambda <1 signify high building/maintenance costs resulting in fewer roads.
 #We first build the complete network and then prune the edges based on the rule XZ * (1 + 1/L) < XY + YZ, i.e., keep edge XZ only if its cost (implemented as edge weight) is lower than combined cost of edges XY and YZ.
 build_networks_by_L <- function(cd_time_matrix, cd_matrix, south_sites, time_cutoff = 43200, L_range = 1:8) {
@@ -1934,6 +1935,75 @@ L4_GG_lcps <- rbind(L4_lcps, GG_unique_lcps)
 
 st_write(L4_GG_lcps, "output/L4_GG_lcps.shp")
 
+###NPDI comparison L4+GG LCPs with roads
+#L4+GG common with roads ordered edge key
+L4_GG_edge_keys_df <- as.data.frame(L4_GG_roads[["common"]]) %>%
+  select(-type)
+
+L4_GG_edge_keys_df <- L4_GG_edge_keys_df %>%
+  mutate(
+    edge_min = pmin(from_id, to_id),
+    edge_max = pmax(from_id, to_id)
+  )
+
+L4_GG_lcps_ordered <- L4_GG_lcps %>%
+  mutate(
+    edge_min = pmin(from_id, to_id),
+    edge_max = pmax(from_id, to_id)
+  ) %>%
+  st_set_crs(value = "EPSG:3395")
+
+#Initialize RNG list to store the results
+L4_GG_NPDIs <- list()
+
+#Loop through the sf objects using normalized order of the from_id and to_id columns while retaining the original column order and enforcing consistent naming of columns
+for (i in 1:nrow(L4_GG_edge_keys_df)) {
+  from_id <- L4_GG_edge_keys_df$from_id[i]
+  to_id <- L4_GG_edge_keys_df$to_id[i]
+  origin_ <- L4_GG_edge_keys_df$edge_min[i]
+  destination <- L4_GG_edge_keys_df$edge_max[i]
+  
+  subset_L4GG <- L4_GG_lcps_ordered %>%
+    filter(edge_min == origin_ & edge_max == destination)
+  
+  subset_south_roads <- south_roads %>%
+    filter(edge_min == origin_ & edge_max == destination)
+  
+  valid_input <- (
+    nrow(subset_L4GG) > 0 &&
+      nrow(subset_south_roads) > 0 &&
+      all(st_is_valid(subset_L4GG)) &&
+      all(st_is_valid(subset_south_roads)) &&
+      length(st_geometry(subset_L4GG)) > 0 &&
+      length(st_geometry(subset_south_roads)) > 0
+  )
+  
+  if (valid_input) {
+    tryCatch({
+      L4GG_pdi_results <- leastcostpath::PDI_validation(
+        lcp = subset_L4GG,
+        comparison = subset_south_roads
+      )
+      
+      #Add original IDs to the result
+      L4GG_pdi_results$from_id <- from_id
+      L4GG_pdi_results$to_id <- to_id
+      
+      #Standardize columns and reorder
+      L4GG_pdi_results <- standardize_cols(L4GG_pdi_results, desired_cols)
+      
+      L4_GG_NPDIs[[paste(from_id, to_id, sep = "_")]] <- L4GG_pdi_results
+    }, error = function(e) {
+      message("Error in PDI_validation for ", from_id, "-", to_id, ": ", e$message)
+    })
+  } else {
+    message("Skipping ", from_id, "-", to_id, ": missing or invalid input")
+  }
+}
+
+L4GG_NPDI_validation <- do.call(rbind, L4_GG_NPDIs)
+sf::st_write(L4GG_NPDI_validation, "output/L4GG_NPDI_validation.shp")
+
 ###########################################################################
 ###### Road network construction from trunk roads
 ###########################################################################
@@ -2221,7 +2291,7 @@ for (source_city in city_ids) {
     if (length(path) > 1) {
       verts <- V(sg)[path]$name
       edge_pairs <- cbind(head(verts, -1), tail(verts, -1))
-      eids <- get.edge.ids(combined_network, t(edge_pairs))
+      eids <- get_edge_ids(combined_network, t(edge_pairs))
       E(combined_network)$keep[eids] <- TRUE
     }
   }
@@ -2232,7 +2302,7 @@ trunk_network <- subgraph_from_edges(combined_network, E(combined_network)[keep]
 #Export
 trunk_edges <- igraph::as_data_frame(trunk_network, what = "edges")
 
-#Extract edges and add coordinates GG
+#Extract edges and add coordinates
 trunk_edges_coord <- trunk_edges %>%
   left_join(sites_sel_coord, by = c("from" = "idAll")) %>%
   rename(x_from = x, y_from = y) %>%
@@ -2282,3 +2352,558 @@ for (i in seq_along(batches)) {
 trunk_edges_lcps <- do.call(rbind, trunk_edges_lcps_list)
 trunk_edges_lcps %>% st_set_crs(3395)
 st_write(trunk_edges_lcps, "output/trunk_edges_lcps.shp")
+
+#Get sample points every 3 km along the trunk roads
+trunk_sample_points <- st_line_sample(trunk_edges_lcps, density = 1/3000)
+
+trunk_sample_points_sf <- st_sf(geometry = trunk_sample_points)
+
+coords <- st_coordinates(trunk_sample_points)
+
+#Convert coordinates from MULTIPOINT to POINT geometries
+trunk_sample_points_flat <- st_as_sf(
+  as.data.frame(coords),
+  coords = c("X", "Y"),
+  crs = st_crs(trunk_edges_lcps)
+) %>%
+  mutate(id = row_number()) %>%
+  select(-L1)
+
+#Find points within 3000m and filter unique points
+points_within_3000m <- st_is_within_distance(trunk_sample_points_flat, trunk_sample_points_flat, dist = 3000, sparse = FALSE)
+
+n <- nrow(trunk_sample_points_flat)
+keep <- rep(TRUE, n)
+
+for (i in seq_len(n)) {
+  if (!keep[i]) next
+  
+  neighbors_to_remove <- which(points_within_3000m[i, ] & seq_len(n) > i)
+  
+  if (length(neighbors_to_remove) > 0) {
+    keep[neighbors_to_remove] <- FALSE
+  }
+}
+
+trunk_sample_unique <- trunk_sample_points_flat[keep, ]
+
+#Cost distance matrix for cities, settlements, and LCP points
+#Add idAll and sequential numbering starting with 1015 (last idAll of south_sites_sel is 1014) to trunk_sample_unique
+trunk_sample_id <- trunk_sample_unique %>%
+  rename(idAll = id) %>%
+  mutate(idAll = 1014 + row_number())
+
+#Merge with south_sites_sel (trunk_sample_id does not have the same columns, so these are appended and filed with NA)
+missing_cols <- setdiff(names(south_sites_sel), names(trunk_sample_id))
+trunk_sample_id[missing_cols] <- NA
+
+trunk_sample_id <- trunk_sample_id[, names(south_sites_sel)]
+
+south_sites_points <- rbind(south_sites_sel, trunk_sample_id)
+
+#Calculate cost distance matrix
+south_sites_points_sp <- as(south_sites_points, "Spatial")
+
+cd_c <- gdistance::costDistance(tr, south_sites_points_sp)
+cd_c_matrix <- as.matrix(cd_c)
+
+id_vector_c <- south_sites_points$idAll
+
+rownames(cd_c_matrix) <- id_vector_c
+colnames(cd_c_matrix) <- id_vector_c
+
+#Calculate time distance matrix
+cd_d_time <- gdistance::costDistance(south_tobler_tr, south_sites_points_sp)
+cd_d_time_matrix <- as.matrix(cd_d_time)
+
+rownames(cd_d_time_matrix) <- id_vector_c
+colnames(cd_d_time_matrix) <- id_vector_c
+
+#Build a graph using adapted approach from Carroll and Carroll 2023 with T- and O-intersections. For each triangle formed by sites X, Y, Z and point T (possible intersection) it evaluates l < (XY+YZ-YT) / (XZ+2YT-XY-YZ) and XZ + YT < XY + XZ in order to create Delta, Lambda or T-Junction. It limits searching onlz for K=6 nearest neighbours of each X in the cost distance matrix to ease compuational load.
+build_networks_by_L_v27 <- function(cd_time_matrix, cd_matrix, south_sites, time_cutoff = 43200, L_range = 1:8) {
+  result_list <- list()
+  
+  all_nodes <- south_sites  # full set of nodes (global indices)
+  n_nodes <- nrow(all_nodes)
+  
+  normal_sites <- 1:363
+  T_sites <- 364:1100
+  
+  for (L in L_range) {
+    message("======================")
+    message("Processing for L = ", L)
+    message("======================")
+    
+    edge_list_all <- list()
+    
+    for (i in normal_sites) {
+      message("Processing site ", i, "/", length(normal_sites), " ...")
+      
+      # reachable normal sites (time-constrained)
+      reachable_idx <- which(cd_time_matrix[i, normal_sites] <= time_cutoff &
+                               !is.infinite(cd_time_matrix[i, normal_sites]))
+      reachable_idx <- normal_sites[reachable_idx]
+      
+      message("  - Found ", length(reachable_idx), " reachable normal sites")
+      if (length(reachable_idx) < 2) next
+      
+      # --- Step 1: Normal sites network construction ---
+      subset_cd <- as.matrix(cd_matrix)[reachable_idx, reachable_idx]
+      
+      edge_list <- t(combn(seq_along(reachable_idx), 2))
+      edges_df <- data.frame(
+        from   = reachable_idx[edge_list[, 1]],  # global indices
+        to     = reachable_idx[edge_list[, 2]],
+        weight = subset_cd[edge_list]
+      )
+      edges_all <- bind_rows(edges_df, edges_df %>% rename(from = to, to = from))
+      
+      # pruning
+      kept_edges <- edges_all %>%
+        mutate(keep = map_lgl(row_number(), function(e_idx) {
+          edge <- edges_all[e_idx, ]
+          X <- edge$from
+          Z <- edge$to
+          XZ <- edge$weight
+          
+          # map to local indices in subset_cd
+          X_loc <- match(X, reachable_idx)
+          Z_loc <- match(Z, reachable_idx)
+          
+          intermediates <- setdiff(seq_len(nrow(subset_cd)), c(X_loc, Z_loc))
+          
+          keep_edge <- !any(sapply(intermediates, function(Y_idx) {
+            XY <- subset_cd[X_loc, Y_idx]
+            YZ <- subset_cd[Y_idx, Z_loc]
+            if (is.infinite(XY) || is.infinite(YZ)) return(FALSE)
+            XY + YZ < XZ * (1 + 1/L)
+          }))
+          
+          keep_edge
+        })) %>%
+        filter(keep) %>%
+        select(from, to, weight)
+      
+      message("  - Step 1 pruning: kept ", nrow(kept_edges), " edges")
+      
+      # --- Step 2: substitute with T sites ---
+      edges_tbl <- kept_edges
+      if (nrow(edges_tbl) > 0) {
+        new_edges <- list()
+        
+        for (idx in seq_len(nrow(edges_tbl))) {
+          X <- edges_tbl$from[idx]
+          Z <- edges_tbl$to[idx]
+          XY <- edges_tbl$weight[idx]
+          
+          for (T in T_sites) {
+            XT <- cd_matrix[X, T]
+            ZT <- cd_matrix[Z, T]
+            if (any(is.infinite(c(XT, ZT)))) next
+            if (XT + ZT < XY) {
+              new_edges <- append(new_edges, list(
+                data.frame(from = X, to = T, weight = XT),
+                data.frame(from = Z, to = T, weight = ZT)
+              ))
+              edges_tbl$weight[idx] <- Inf  # mark for removal
+            }
+          }
+        }
+        
+        edges_tbl <- edges_tbl %>% filter(!is.infinite(weight))
+        if (length(new_edges) > 0) edges_tbl <- bind_rows(edges_tbl, bind_rows(new_edges))
+        
+        # deduplicate edges
+        edges_tbl <- edges_tbl %>%
+          rowwise() %>%
+          mutate(
+            from_clean = min(from, to),
+            to_clean   = max(from, to)
+          ) %>%
+          ungroup() %>%
+          select(from = from_clean, to = to_clean, weight) %>%
+          group_by(from, to) %>%
+          summarise(weight = min(weight), .groups = "drop")
+      }
+      
+      if (nrow(edges_tbl) > 0) {
+        edge_list_all[[length(edge_list_all) + 1]] <- edges_tbl
+      }
+    }
+    
+    # --- Merge all edge tables into one global edge list ---
+    all_edges <- bind_rows(edge_list_all) %>%
+      rowwise() %>%
+      mutate(
+        from_clean = min(from, to),
+        to_clean   = max(from, to)
+      ) %>%
+      ungroup() %>%
+      select(from = from_clean, to = to_clean, weight) %>%
+      group_by(from, to) %>%
+      summarise(weight = min(weight), .groups = "drop")
+    
+    network_final <- sfnetwork(
+      nodes = all_nodes %>% st_as_sf(),
+      edges = all_edges,
+      node_key = "node_id",
+      directed = FALSE
+    )
+    
+    result_list[[paste0("L", L)]] <- network_final
+  }
+  
+  return(result_list)
+}
+
+#Deploy
+build_networks_by_lv27 <- build_networks_by_L_v27(cd_time_matrix = cd_d_time_matrix, cd_matrix = cd_c_matrix, south_sites = south_sites_points)
+######
+build_networks_by_L_v28 <- function(cd_time_matrix, cd_matrix, south_sites, time_cutoff = 43200, L_range = 1:8) {
+  result_list <- list()
+  
+  all_nodes <- south_sites  # full set of nodes (global indices)
+  n_nodes <- nrow(all_nodes)
+  
+  normal_sites <- 1:363
+  T_sites <- 364:1100
+  
+  for (L in L_range) {
+    message("======================")
+    message("Processing for L = ", L)
+    message("======================")
+    
+    edge_list_all <- list()
+    
+    for (i in normal_sites) {
+      message("Processing site ", i, "/", length(normal_sites), " ...")
+      
+      # reachable normal sites (time-constrained)
+      reachable_idx <- which(cd_time_matrix[i, normal_sites] <= time_cutoff &
+                               !is.infinite(cd_time_matrix[i, normal_sites]))
+      reachable_idx <- normal_sites[reachable_idx]
+      
+      message("  - Found ", length(reachable_idx), " reachable normal sites")
+      if (length(reachable_idx) < 2) next
+      
+      # --- Step 1: Normal sites network construction ---
+      subset_cd <- as.matrix(cd_matrix)[reachable_idx, reachable_idx]
+      
+      edge_list <- t(combn(seq_along(reachable_idx), 2))
+      edges_df <- data.frame(
+        from   = reachable_idx[edge_list[, 1]],  # global indices
+        to     = reachable_idx[edge_list[, 2]],
+        weight = subset_cd[edge_list]
+      )
+      edges_all <- bind_rows(edges_df, edges_df %>% rename(from = to, to = from))
+      
+      # pruning
+      kept_edges <- edges_all %>%
+        mutate(keep = map_lgl(row_number(), function(e_idx) {
+          edge <- edges_all[e_idx, ]
+          X <- edge$from
+          Z <- edge$to
+          XZ <- edge$weight
+          
+          # map to local indices in subset_cd
+          X_loc <- match(X, reachable_idx)
+          Z_loc <- match(Z, reachable_idx)
+          
+          intermediates <- setdiff(seq_len(nrow(subset_cd)), c(X_loc, Z_loc))
+          
+          keep_edge <- !any(sapply(intermediates, function(Y_idx) {
+            XY <- subset_cd[X_loc, Y_idx]
+            YZ <- subset_cd[Y_idx, Z_loc]
+            if (is.infinite(XY) || is.infinite(YZ)) return(FALSE)
+            XY + YZ < XZ * (1 + 1/L)
+          }))
+          
+          keep_edge
+        })) %>%
+        filter(keep) %>%
+        select(from, to, weight)%>%
+        mutate(config = "Lambda")
+      
+      message("  - Step 1 pruning: kept ", nrow(kept_edges), " edges")
+      
+      # --- Step 2: substitute with T sites (global indices) ---
+      edges_tbl <- kept_edges
+      if (nrow(edges_tbl) > 0) {
+        new_edges <- list()
+        remove_edges <- list()
+        
+        # Work with Y as a global vertex present in this per-site edge set
+        candidate_Y <- intersect(reachable_idx, unique(c(edges_tbl$from, edges_tbl$to)))
+        
+        for (Y in candidate_Y) {
+          # neighbors of Y (global ids)
+          neighbors <- c(
+            edges_tbl$from[edges_tbl$to == Y],
+            edges_tbl$to[edges_tbl$from == Y]
+          )
+          neighbors <- unique(neighbors)
+          if (length(neighbors) < 2) next
+          
+          # consider pairs X, Z around Y
+          for (pair in combn(neighbors, 2, simplify = FALSE)) {
+            X <- pair[[1]]
+            Z <- pair[[2]]
+            
+            XY <- cd_matrix[X, Y]
+            YZ <- cd_matrix[Y, Z]
+            XZ <- cd_matrix[X, Z]
+            if (any(is.infinite(c(XY, YZ, XZ)))) next
+            
+            # search a T that satisfies the specified condition
+            for (T in T_sites) {
+              YT <- cd_matrix[Y, T]
+              XT <- cd_matrix[X, T]
+              ZT <- cd_matrix[Z, T]
+              if (any(is.infinite(c(YT, XT, ZT)))) next
+              
+              # user-specified condition:
+              if (XZ + YT < XY + YZ) {
+                # remove XY and YZ (use undirected min/max keys)
+                remove_edges <- append(remove_edges, list(
+                  c(min(X, Y), max(X, Y)),
+                  c(min(Y, Z), max(Y, Z))
+                ))
+                # add XT, YT, ZT (global ids)
+                new_edges <- append(new_edges, list(
+                  data.frame(from = X, to = T, weight = XT, config = "T-config"),
+                  data.frame(from = Y, to = T, weight = YT, config = "T-config"),
+                  data.frame(from = Z, to = T, weight = YT, config = "T-config")
+                ))
+                break
+              }
+            }
+          }
+        }
+        
+        # drop replaced XY, YZ
+        if (length(remove_edges) > 0) {
+          remove_edges_df <- do.call(rbind, lapply(remove_edges, function(e)
+            data.frame(from_clean = e[1], to_clean = e[2])
+          ))
+          edges_tbl <- edges_tbl %>%
+            mutate(from_clean = pmin(from, to), to_clean = pmax(from, to)) %>%
+            anti_join(remove_edges_df, by = c("from_clean", "to_clean")) %>%
+            select(from, to, weight)
+        }
+        
+        # add new XT, YT, ZT edges
+        if (length(new_edges) > 0) {
+          edges_tbl <- bind_rows(edges_tbl, bind_rows(new_edges))
+        }
+        
+        #Deduplicate undirected edges by (min, max), keep smallest weight
+        edges_tbl <- edges_tbl %>%
+          rowwise() %>%
+          mutate(from_clean = min(from, to), to_clean = max(from, to)) %>%
+          ungroup() %>%
+          select(from = from_clean, to = to_clean, weight, config) %>%
+          group_by(from, to) %>%
+          summarise(weight = min(weight), config = paste(unique(config), collapse = ";"), .groups = "drop")
+      }
+      
+      if (nrow(edges_tbl) > 0) {
+        edge_list_all[[length(edge_list_all) + 1]] <- edges_tbl
+      }
+    }
+    
+    # --- Merge all edge tables into one global edge list ---
+    all_edges <- bind_rows(edge_list_all) %>%
+      rowwise() %>%
+      mutate(
+        from_clean = min(from, to),
+        to_clean   = max(from, to)
+      ) %>%
+      ungroup() %>%
+      select(from = from_clean, to = to_clean, weight, config) %>%
+      group_by(from, to) %>%
+      summarise(weight = min(weight), config = paste(unique(config), collapse = ";"), .groups = "drop")
+    
+    network_final <- sfnetwork(
+      nodes = all_nodes %>% st_as_sf(),
+      edges = all_edges,
+      node_key = "node_id",
+      directed = FALSE
+    )
+    
+    result_list[[paste0("L", L)]] <- network_final
+  }
+  
+  return(result_list)
+}
+
+#Deploy
+build_networks_by_lv28 <- build_networks_by_L_v28(cd_time_matrix = cd_d_time_matrix, cd_matrix = cd_c_matrix, south_sites = south_sites_points)
+
+#Export
+walk2(names(build_networks_by_lv28), build_networks_by_lv28, function(L_name, net) {
+  
+  message("Exporting edges for ", L_name, "...")
+  
+  # Extract edges
+  edges_l_df <- net %>% activate("edges") %>% as_tibble()
+  
+  # Extract nodes with index + idAll
+  nodes_l_df <- net %>% 
+    activate("nodes") %>% 
+    as_tibble() %>% 
+    mutate(index = row_number()) %>% 
+    select(index, idAll, geometry)
+  
+  # Join node geometries and ids to edges
+  edge_lines_df <- edges_l_df %>%
+    left_join(nodes_l_df, by = c("from" = "index")) %>%
+    rename(geom_from = geometry, from_id = idAll) %>%
+    left_join(nodes_l_df, by = c("to" = "index")) %>%
+    rename(geom_to = geometry, to_id = idAll)
+  
+  # Build line geometries
+  edge_lines_df$geometry <- st_sfc(
+    mapply(function(g1, g2) {
+      st_linestring(rbind(st_coordinates(g1), st_coordinates(g2)))
+    }, edge_lines_df$geom_from, edge_lines_df$geom_to, SIMPLIFY = FALSE),
+    crs = st_crs(net)
+  )
+  
+  # Create sf object: now with from_id / to_id = original idAll
+  edge_lines <- st_sf(
+    edge_lines_df %>% select(from_id, to_id, weight, config),
+    geometry = edge_lines_df$geometry
+  )
+  
+  # Write shapefile
+  st_write(edge_lines,
+           dsn = file.path("output", paste0("edges_", L_name, "_v3.shp")),
+           delete_layer = TRUE)
+})
+
+###Extract sorted edge lists for L3 and L4 and calculate LCPs
+
+#Initialize list of edge keys by L
+networks_edge_keys_by_L_v3 <- list()
+
+#Iterate over networks_by_L list
+for (i in seq_along(build_networks_by_lv28)) {
+  L_name <- names(build_networks_by_lv28)[i]
+  net <- build_networks_by_lv28[[i]]
+  
+  #Extract edges and nodes
+  edges_df <- net %>% activate("edges") %>% as_tibble()
+  nodes_df <- net %>% activate("nodes") %>% as_tibble()
+  
+  if (!"idAll" %in% names(nodes_df)) {
+    message("Skipping ", L_name, ": idAll column missing.")
+    next
+  }
+  
+  nodes_df <- nodes_df %>%
+    mutate(index = row_number()) %>%
+    select(index, idAll)
+  
+  #Join edge table to get original node IDs
+  edges_with_ids <- edges_df %>%
+    left_join(nodes_df, by = c("from" = "index")) %>%
+    rename(from_id = idAll) %>%
+    left_join(nodes_df, by = c("to" = "index")) %>%
+    rename(to_id = idAll) %>%
+    select(from_id, to_id)
+  
+  print(head(edges_with_ids))
+  
+  #Sort and create character keys
+  normalized_edges <- sort_edges(edges_with_ids) %>%
+    mutate(key = paste(edge_min, edge_max, sep = "-")) %>%
+    pull(key)
+  
+  #Store character vector of keys
+  networks_edge_keys_by_L_v3[[L_name]] <- normalized_edges
+}
+
+###Calculate L=3 v2 unique LCPs
+
+#Get sorted edge keys
+L3_v3_keys <- networks_edge_keys_by_L_v3[["L3"]]
+
+L3_v3_edge_keys <- tibble(key = L3_v3_keys) %>%
+  separate(key, into = c("from_id", "to_id"), sep = "-")
+
+#Initialize list
+L3_v3_lcps_list <- list()
+
+batch_size <- 1
+indices <- seq_len(nrow(L3_v3_edge_keys))
+batches <- split(indices, ceiling(indices / batch_size))
+
+for (i in seq_along(batches)) {
+  cat("Processing batch", i, "of", length(batches), "\n")
+  
+  batch_results <- map(batches[[i]], function(j) {
+    row <- L3_v3_edge_keys[j, ]
+    
+    tryCatch({
+      origin <- south_sites_points %>% filter(idAll == row$from_id)
+      destination <- south_sites_points %>% filter(idAll == row$to_id)
+      
+      if (nrow(origin) == 0 || nrow(destination) == 0) {
+        message("Skipping row ", j, ": origin or destination not found.")
+        return(NULL)
+      }
+      
+      lcp <- create_lcp(
+        x = south_cs,
+        origin = origin,
+        destination = destination,
+        cost_distance = FALSE,
+        check_locations = FALSE
+      )
+      
+      # Add IDs to result
+      lcp$from_id <- row$from_id
+      lcp$to_id <- row$to_id
+      lcp
+    }, error = function(e) {
+      message("Error in row ", j, ": ", e$message)
+      return(NULL)
+    })
+  })
+  
+  # Append batch results to growing list
+  L3_v3_lcps_list <- c(L3_v3_lcps_list, batch_results)
+  gc(verbose = FALSE)
+}
+
+L3_v3_lcps <- do.call(rbind, L3_v3_lcps_list)
+
+L3_v3_lcps <- L3_v3_lcps %>%
+  mutate(
+    from_id = as.integer(from_id),
+    to_id   = as.integer(to_id)
+  )
+
+st_write(L3_v3_lcps, "output/L3_v3_lcps.shp")
+
+####T-junctions for known trunk/main roads
+south_sites_trunk <- st_read("data/south_sites_trunk.shp")
+south_sites_trunk<- st_zm(south_sites_trunk, drop = TRUE, what = "ZM")
+
+#Calculate cost distance matrix
+south_sites_trunk_sp <- as(south_sites_trunk, "Spatial")
+
+cd_x <- gdistance::costDistance(tr, south_sites_trunk_sp)
+cd_x_matrix <- as.matrix(cd_x)
+
+id_vector_x <- south_sites_trunk$idAll
+
+rownames(cd_x_matrix) <- id_vector_x
+colnames(cd_x_matrix) <- id_vector_x
+
+#Calculate time distance matrix
+cd_y_time <- gdistance::costDistance(south_tobler_tr, south_sites_trunk_sp)
+cd_y_time_matrix <- as.matrix(cd_y_time)
+
+rownames(cd_y_time_matrix) <- id_vector_x
+colnames(cd_y_time_matrix) <- id_vector_x
